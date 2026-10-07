@@ -10,6 +10,7 @@ bodies run on per-handle workers), not per-turn threads.
 import logging
 import os
 import threading
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -39,6 +40,7 @@ class DurableTurnLease:
         self.holder = holder
         self.stop = threading.Event()
         self.refresh_interval = float(getattr(agent, "_session_turn_lease_refresh_interval", 60.0))
+        self._last_refresh_ok = time.monotonic()  # admission just wrote the lease row
         self._lock = threading.Lock()
         self.turn_active = False
         self.interrupt_message: Optional[str] = None
@@ -192,6 +194,7 @@ class DurableTurnLease:
             if self.db.refresh_session_turn_lease(
                 self._current_session_id(), self.holder, ttl_seconds=LEASE_TTL_SECONDS
             ):
+                self._last_refresh_ok = time.monotonic()
                 return None
             if self.stop.is_set():
                 return False
@@ -202,6 +205,20 @@ class DurableTurnLease:
         except Exception:
             if self.stop.is_set():
                 return False
+            # A refresh that RAISED (typically "database is locked" while another process holds
+            # the state.db write lock under memory pressure) is not a lost lease: the row still
+            # names this holder until the TTL lapses. Killing the turn on the first miss threw
+            # away cron runs and gateway turns minutes into their work. Keep renewing while a
+            # retry can still land before expiry; only a fenced miss (False above) or running
+            # out of TTL margin is a loss.
+            held_for = time.monotonic() - self._last_refresh_ok
+            if held_for + 2 * self.refresh_interval < LEASE_TTL_SECONDS:
+                logger.warning(
+                    "Session turn lease refresh failed transiently (%.0fs since last renewal, "
+                    "TTL %.0fs); retrying next tick: %s",
+                    held_for, LEASE_TTL_SECONDS, self._current_session_id(), exc_info=True,
+                )
+                return None
             logger.warning(
                 "Failed to refresh session turn lease: %s", self._current_session_id(), exc_info=True,
             )
