@@ -140,10 +140,10 @@ def _connect() -> sqlite3.Connection:
     # Late imports: a scheduler daemon that outlives an on-disk upgrade already has the OLD
     # ``hermes_cli.sqlite_util`` / ``cron.jobs`` cached, so new names must be resolved at call time,
     # not at import time (the guarantee cron/ledger.py used to carry, see e24c8499).
-    from hermes_cli.sqlite_util import open_db
+    from hermes_cli.sqlite_util import open_db, CRON_DB_BUSY_TIMEOUT_MS
 
     path = _path()
-    conn = open_db(path, db_label="cron/deliveries.db", synchronous_full=True, initialize=_initialize_schema)
+    conn = open_db(path, db_label="cron/deliveries.db", synchronous_full=True, busy_timeout_ms=CRON_DB_BUSY_TIMEOUT_MS, initialize=_initialize_schema)
     try:
         path.chmod(0o600)
     except OSError:

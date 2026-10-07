@@ -15,6 +15,15 @@ from pathlib import Path
 from typing import Callable, Iterator
 
 
+# Cron ledgers (executions/deliveries/incidents) are shared by the scheduler, the
+# detached workers and the gateway. On a host under memory pressure a writer that
+# is swapped out mid-transaction holds the lock for several seconds; the 5 s
+# default then turned an ordinary wait into "database is locked" and the whole
+# job was recorded as failed after it had already run. Measured on the Maloca
+# VPS: 6 jobs lost in 24 h, reproduced with an 8 s writer (5 s fails, 30 s ok).
+CRON_DB_BUSY_TIMEOUT_MS = 30000
+
+
 def open_db(
     path: Path | str,
     *,
