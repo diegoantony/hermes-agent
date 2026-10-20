@@ -1936,6 +1936,19 @@ def _candidate_pool_exhausted(agent, fb_provider: str, fb_model: str) -> bool:
             return False
     if pool is None or not pool.has_credentials() or pool.has_available(model=fb_model):
         return False
+    # ``has_available`` reads the persisted cooldown only. A Codex weekly 429 persists a reset days
+    # out, but the quota can reopen early (#43747) and the live probe that detects it runs only on
+    # the clear_expired path (``select``/``reclaim``). Without asking it here, a healthy Codex
+    # fallback was skipped as "exhausted" while other sessions were using the same account — and a
+    # primary 429 ended the turn with no fallback. ``reclaim`` is throttled per token and never
+    # bumps request_count, so it is safe on this error path.
+    try:
+        for entry in list(pool.entries()):
+            if pool.reclaim(entry.id, model=fb_model) is not None:
+                logger.info("Fallback %s/%s: persisted cooldown lifted by live check", fb_provider, fb_model)
+                return False
+    except Exception as exc:  # never let the probe itself block the walk decision
+        logger.debug("Fallback %s/%s: live cooldown check failed: %s", fb_provider, fb_model, exc)
     until = pool.next_available_at(model=fb_model)
     return until is None or until - time.time() > 600
 
