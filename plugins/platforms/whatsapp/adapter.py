@@ -212,12 +212,15 @@ def _file_content_hash(path: Path) -> str:
 
 
 def check_whatsapp_requirements() -> bool:
-    """Node.js (Hermes-managed first, so a bad system Node on PATH can't break Windows) is available."""
-    _node = find_node_executable("node")
-    try:
-        return bool(_node) and subprocess.run([_node, "--version"], timeout=5, **_RUN_TEXT).returncode == 0
-    except Exception:
-        return False
+    """Node.js (Hermes-managed first) is discoverable.
+
+    This hook runs while the gateway creates an adapter. Spawning ``node --version`` here made
+    host pressure look like a missing dependency: after a five-second timeout adapter creation
+    returned ``None`` and the reconnect watcher permanently removed WhatsApp from its queue.
+    Actual process failures remain observable in ``connect()`` and therefore follow its retry
+    policy; requirement discovery itself must be cheap and side-effect free.
+    """
+    return bool(find_node_executable("node"))
 
 
 # Env vars bridge.js consumes; injected because a multiplexed subprocess's os.environ lacks the secondary profile's .env.
