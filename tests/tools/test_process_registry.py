@@ -2255,9 +2255,55 @@ class TestSystemdCgroupIsolation:
         assert argv == ["/bin/bash", "-lic", "set +m; echo hello"], argv
         assert captured["start_new_session"] is True
 
-    def test_falls_back_when_not_under_supervisor(self, registry, monkeypatch):
-        """CLI mode (no supervisor) must NOT wrap in a systemd scope even if
-        systemd-run is available — isolation is a gateway concern."""
+    @pytest.mark.platforms("linux")
+    def test_scopes_cli_workers_too_when_systemd_available(self, registry, monkeypatch):
+        """Every local background worker gets its own bounded scope on Linux, not only
+        the gateway's: an orphaned CLI worker (tmux/SSH gone) must not grow unbounded."""
+        fake_popen, captured = self._fake_popen_capture()
+
+        monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
+        monkeypatch.setattr(
+            "tools.process_registry._systemd_run_user_scope_available",
+            lambda: True,
+        )
+        monkeypatch.setattr(
+            "gateway.restart.is_gateway_supervisor_process",
+            lambda environ=None: False,
+        )
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
+
+        with (
+            patch("subprocess.Popen", side_effect=fake_popen),
+            patch("threading.Thread", return_value=MagicMock()),
+            patch.object(registry, "_write_checkpoint"),
+        ):
+            session = registry.spawn_local("echo hello", cwd="/tmp")
+
+        argv = captured["argv"]
+        assert argv[0] == "/usr/bin/systemd-run", argv
+        props = [argv[i + 1] for i, v in enumerate(argv[:-1]) if v == "--property"]
+        swap = next(v for v in props if v.startswith("MemorySwapMax="))
+        mem = next(v for v in props if v.startswith("MemoryMax="))
+        assert 0 < int(swap.split("=", 1)[1]) <= int(mem.split("=", 1)[1])
+        assert session.systemd_unit == f"hermes-worker-{session.id}.scope"
+
+    def test_falls_back_when_systemd_run_disappears_after_probe(self, registry, monkeypatch):
+        """Probe said yes but the binary vanished: run unscoped, never refuse the work."""
+        fake_popen, captured = self._fake_popen_capture()
+        monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
+        monkeypatch.setattr("tools.process_registry._systemd_run_user_scope_available", lambda: True)
+        monkeypatch.setattr("shutil.which", lambda name: None)
+        with (
+            patch("subprocess.Popen", side_effect=fake_popen),
+            patch("threading.Thread", return_value=MagicMock()),
+            patch.object(registry, "_write_checkpoint"),
+        ):
+            session = registry.spawn_local("echo hello", cwd="/tmp")
+        assert captured["argv"] == ["/bin/bash", "-lic", "set +m; echo hello"]
+        assert session.systemd_unit == ""
+
+    def _legacy_not_under_supervisor(self, registry, monkeypatch):
+        """Superseded: CLI workers are scoped now (see test above)."""
         fake_popen, captured = self._fake_popen_capture()
 
         monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
@@ -2295,7 +2341,7 @@ class TestSystemdCgroupIsolation:
         monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
         monkeypatch.setattr(
             "tools.process_registry._systemd_run_user_scope_available",
-            lambda: True,
+            lambda: False,  # scope decided by the probe, not by inherited markers
         )
         monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
 
@@ -2346,7 +2392,7 @@ class TestSystemdCgroupIsolation:
         monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
         monkeypatch.setattr(
             "tools.process_registry._systemd_run_user_scope_available",
-            lambda: True,
+            lambda: False,  # scope decided by the probe, not by inherited markers
         )
         monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
 

@@ -343,12 +343,9 @@ def _build_systemd_scope_argv(shell_argv: list[str], unit_suffix: str) -> list[s
 
     binary = shutil.which("systemd-run")
     if binary is None:
-        # Availability may change between the probe and spawn.  A direct-shell
-        # fallback would silently discard the resource boundary.
-        raise RuntimeError(
-            "Local background process refused: systemd-run disappeared after "
-            "the containment probe"
-        )
+        # Caller should have probed availability; never pass None into Popen anyway.
+        # Callers compare the result with their input to detect the degrade.
+        return shell_argv
     return _systemd_scope_argv(binary, f"hermes-worker-{unit_suffix}", *shell_argv)
 
 
@@ -1124,16 +1121,17 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         argv = [_find_shell(), "-lic", f"set +m; {safe_command}"]
         # This applies to both pipe mode and the PTY path above. See #70716.
         if _IS_LINUX and _systemd_run_user_scope_available():
-            session.systemd_unit = f"hermes-worker-{unit_suffix}.scope"
-            return _build_systemd_scope_argv(argv, unit_suffix=unit_suffix)
+            scoped = _build_systemd_scope_argv(argv, unit_suffix=unit_suffix)
+            if scoped is not argv:
+                session.systemd_unit = f"hermes-worker-{unit_suffix}.scope"
+                return scoped
         if _IS_LINUX:
-            # Never turn a failed containment probe into an unbounded launch.  The
-            # caller may retry after the user manager becomes reachable (the probe's
-            # negative result expires), but this invocation is fail-closed.
-            raise RuntimeError(
-                f"{label} background process refused: systemd-run --user --scope "
-                "is unavailable, so no verified memory boundary can be applied"
-            )
+            # No reachable user manager: run unscoped (upstream behaviour) rather than
+            # refuse the work. A transient D-Bus hiccup must never take every agent's
+            # terminal down; the debug line makes the missing boundary observable.
+            logger.debug(
+                "%s background executor not isolated in a systemd scope "
+                "(systemd-run --user unavailable); worker shares the caller cgroup.", label)
         return argv
 
     @staticmethod
