@@ -151,6 +151,7 @@ def _redirect_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "gateway.platforms.base.VIDEO_CACHE_DIR", tmp_path / "video_cache"
     )
+    monkeypatch.setenv("HERMES_USER_FILES_DIR", str(tmp_path / "user_files"))
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +264,35 @@ class TestDocumentDownloadBlock:
         assert event.media_types == ["application/zip"]
 
     @pytest.mark.asyncio
+    async def test_xlsm_document_cached(self, adapter):
+        """A .xlsm upload should be cached, surfaced, and MIME-tagged."""
+        doc = _make_document(
+            file_name="treino.xlsm",
+            mime_type="application/vnd.ms-excel.sheet.macroEnabled.12",
+            file_size=100,
+        )
+        msg = _make_message(document=doc)
+        update = _make_update(msg)
+
+        await adapter._handle_media_message(update, MagicMock())
+        event = adapter.handle_message.call_args[0][0]
+        assert event.media_urls and event.media_urls[0].endswith("treino.xlsm")
+        assert event.media_types == ["application/vnd.ms-excel.sheet.macroEnabled.12"]
+
+    @pytest.mark.asyncio
+    async def test_unknown_extension_document_cached_as_octet_stream(self, adapter):
+        """Unknown document extensions should be cached instead of dropped."""
+        doc = _make_document(file_name="payload.custom", file_size=100)
+        doc.mime_type = None
+        msg = _make_message(document=doc)
+        update = _make_update(msg)
+
+        await adapter._handle_media_message(update, MagicMock())
+        event = adapter.handle_message.call_args[0][0]
+        assert event.media_urls and event.media_urls[0].endswith("payload.custom")
+        assert event.media_types == ["application/octet-stream"]
+
+    @pytest.mark.asyncio
     async def test_png_document_is_routed_as_image(self, adapter):
         """Telegram documents that are really PNGs should use the image path."""
         file_obj = _make_file_obj(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
@@ -338,14 +368,17 @@ class TestDocumentDownloadBlock:
         assert event.media_types == ["application/pdf"]
 
     @pytest.mark.asyncio
-    async def test_missing_filename_and_mime_rejected(self, adapter):
-        doc = _make_document(file_name=None, mime_type=None, file_size=100)
+    async def test_missing_filename_and_mime_cached_as_generic_document(self, adapter):
+        doc = _make_document(file_size=100)
+        doc.file_name = None
+        doc.mime_type = None
         msg = _make_message(document=doc)
         update = _make_update(msg)
 
         await adapter._handle_media_message(update, MagicMock())
         event = adapter.handle_message.call_args[0][0]
-        assert "Unsupported" in event.text
+        assert event.media_urls and event.media_urls[0].endswith("document.bin")
+        assert event.media_types == ["application/octet-stream"]
 
     @pytest.mark.asyncio
     async def test_unicode_decode_error_handled(self, adapter):

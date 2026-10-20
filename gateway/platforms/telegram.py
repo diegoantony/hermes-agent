@@ -5381,23 +5381,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 # ext-in-SUPPORTED_IMAGE_DOCUMENT_TYPES branch would be dead
                 # code — the extension sets are identical.
 
-                # Check if supported
-                if ext not in SUPPORTED_DOCUMENT_TYPES:
-                    supported_list = ", ".join(sorted(SUPPORTED_DOCUMENT_TYPES.keys()))
-                    event.text = (
-                        f"Unsupported document type '{ext or 'unknown'}'. "
-                        f"Supported types: {supported_list}"
-                    )
-                    logger.info("[Telegram] Unsupported document type: %s", ext or "unknown")
-                    await self.handle_message(event)
-                    return
-
-                # Download and cache
+                # Download and cache.  Unknown document extensions are accepted
+                # as application/octet-stream instead of being dropped; the
+                # local path is surfaced to the agent so it can inspect/convert
+                # the file with terminal tools.
                 file_obj = await doc.get_file()
                 doc_bytes = await file_obj.download_as_bytearray()
                 raw_bytes = bytes(doc_bytes)
-                cached_path = cache_document_from_bytes(raw_bytes, original_filename or f"document{ext}")
-                mime_type = SUPPORTED_DOCUMENT_TYPES[ext]
+                cache_name = original_filename or f"document{ext or '.bin'}"
+                cached_path = cache_document_from_bytes(raw_bytes, cache_name)
+                mime_type = SUPPORTED_DOCUMENT_TYPES.get(ext) or doc.mime_type or "application/octet-stream"
                 event.media_urls = [cached_path]
                 event.media_types = [mime_type]
                 logger.info("[Telegram] Cached user document at %s", cached_path)

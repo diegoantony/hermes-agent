@@ -1081,11 +1081,25 @@ SUPPORTED_DOCUMENT_TYPES = {
     ".zip": "application/zip",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     ".ts": "text/plain",
     ".py": "text/plain",
     ".sh": "text/plain",
 }
+
+
+def get_user_file_archive_dir() -> Path:
+    """Return the persistent user-upload archive directory.
+
+    Platform caches are intentionally ephemeral; this archive is the durable,
+    user-facing history for files uploaded through messaging platforms.
+    Operators can override it with HERMES_USER_FILES_DIR.
+    """
+    raw = os.environ.get("HERMES_USER_FILES_DIR", "~/hermes_user_files")
+    archive_dir = Path(os.path.expanduser(raw))
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    return archive_dir
 
 
 # ---------------------------------------------------------------------------
@@ -1143,6 +1157,20 @@ def cache_document_from_bytes(data: bytes, filename: str) -> str:
     if not filepath.resolve().is_relative_to(cache_dir.resolve()):
         raise ValueError(f"Path traversal rejected: {filename!r}")
     filepath.write_bytes(data)
+    try:
+        # Keep a durable historical copy outside the short-lived document cache.
+        # Layout: ~/hermes_user_files/YYYY-MM-DD/<ext>/doc_<id>_name.ext
+        ext = filepath.suffix.lower() or ".noext"
+        day = datetime.now().strftime("%Y-%m-%d")
+        archive_dir = get_user_file_archive_dir() / day / ext.lstrip(".")
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        archive_path = archive_dir / cached_name
+        archive_path.write_bytes(data)
+        logger.info("Archived user document at %s", archive_path)
+    except Exception:
+        # Archival is best-effort; never drop an upload because the durable
+        # archive path is temporarily unavailable.
+        logger.warning("Failed to archive user document %s", filename, exc_info=True)
     return str(filepath)
 
 

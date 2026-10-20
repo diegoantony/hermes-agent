@@ -28,6 +28,7 @@ def _redirect_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "gateway.platforms.base.DOCUMENT_CACHE_DIR", tmp_path / "doc_cache"
     )
+    monkeypatch.setenv("HERMES_USER_FILES_DIR", str(tmp_path / "user_files"))
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +152,7 @@ class TestSupportedDocumentTypes:
 
     @pytest.mark.parametrize(
         "ext",
-        [".pdf", ".md", ".txt", ".zip", ".docx", ".xlsx", ".pptx"],
+        [".pdf", ".md", ".txt", ".zip", ".docx", ".xlsx", ".xlsm", ".pptx"],
     )
     def test_expected_extensions_present(self, ext):
         assert ext in SUPPORTED_DOCUMENT_TYPES

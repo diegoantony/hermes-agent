@@ -409,8 +409,18 @@ async def api_auth_me(request: Request):
     """Return the verified session as JSON. Auth-required (gate enforces)."""
     sess = getattr(request.state, "session", None)
     if sess is None:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+        # Keep response shape stable for SPA callers that expect identity fields.
+        return {
+            "authenticated": False,
+            "user_id": "",
+            "email": "",
+            "display_name": "",
+            "org_id": "",
+            "provider": "",
+            "expires_at": 0,
+        }
     return {
+        "authenticated": True,
         "user_id": sess.user_id,
         "email": sess.email,
         "display_name": sess.display_name,
