@@ -98,10 +98,11 @@ WATCH_GLOBAL_WINDOW_SECONDS = 10
 WATCH_GLOBAL_COOLDOWN_SECONDS = 30
 
 
-# --- systemd cgroup isolation for gateway-spawned local executors ------------------
-# Under a systemd gateway with MemoryMax, local background commands inherit the gateway's
-# cgroup, so a memory-heavy executor can get the ENTIRE gateway killed by systemd-oomd;
-# ``systemd-run --user --scope`` gives the worker its own transient cgroup. Usability is
+# --- systemd cgroup isolation for local background executors -----------------------
+# Local background commands can outlive the agent that launched them.  That is true for
+# an interactive CLI as well as for the gateway: a promoted long foreground call can be
+# orphaned when its tmux/SSH session disappears. ``systemd-run --user --scope`` gives every
+# tracked local worker its own bounded transient cgroup. Usability is
 # probed and cached for a bounded TTL (binary present but user D-Bus absent in system services/containers).
 # A memory-heavy executor (Codex, tests, Node) can push the whole cgroup past MemoryMax and trigger
 # systemd-oomd to kill the ENTIRE gateway — taking down the messaging control plane and silently losing the
@@ -120,6 +121,7 @@ _SYSTEMD_RUN_NO_EXPAND = True
 _MIN_WORKER_MEMORY_MAX_BYTES = 64 * 1024 * 1024
 _DEFAULT_WORKER_MEMORY_MAX_BYTES = 1024 * 1024 * 1024
 _WORKER_MEMORY_MAX_CAP_BYTES = 4 * 1024 * 1024 * 1024
+_WORKER_MEMORY_SWAP_MAX_CAP_BYTES = 1024 * 1024 * 1024
 
 
 def _worker_memory_max_bytes() -> int:
@@ -182,10 +184,13 @@ def _systemd_scope_argv(binary: str, unit_name: str, *argv: str) -> list[str]:
     No ``OOMPolicy=``: transient scopes reject it on systemd <253 (#102486).
     ``--expand-environment=no`` keeps the command byte-identical (#132385)."""
     no_expand = ["--expand-environment=no"] if _SYSTEMD_RUN_NO_EXPAND else []
+    memory_max = _worker_memory_max_bytes()
+    memory_swap_max = min(memory_max, _WORKER_MEMORY_SWAP_MAX_CAP_BYTES)
     return [
         binary, "--user", "--scope", "--quiet", *no_expand, "--unit", unit_name, "--collect",
         "--property", "MemoryAccounting=yes",
-        "--property", f"MemoryMax={_worker_memory_max_bytes()}",
+        "--property", f"MemoryMax={memory_max}",
+        "--property", f"MemorySwapMax={memory_swap_max}",
         "--", *argv,
     ]
 
@@ -338,8 +343,12 @@ def _build_systemd_scope_argv(shell_argv: list[str], unit_suffix: str) -> list[s
 
     binary = shutil.which("systemd-run")
     if binary is None:
-        # Caller should have probed availability; never pass None into Popen anyway.
-        return shell_argv
+        # Availability may change between the probe and spawn.  A direct-shell
+        # fallback would silently discard the resource boundary.
+        raise RuntimeError(
+            "Local background process refused: systemd-run disappeared after "
+            "the containment probe"
+        )
     return _systemd_scope_argv(binary, f"hermes-worker-{unit_suffix}", *shell_argv)
 
 
@@ -1108,21 +1117,23 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
 
     def _scope_argv(self, session: ProcessSession, safe_command: str, unit_suffix: str, label: str) -> list[str]:
         """Login-shell argv for *safe_command* (parity with LocalEnvironment: rc files
-        sourced, user tools on PATH), wrapped in a transient systemd scope when we are
-        the supervised gateway (own cgroup: an OOM kills only the worker, not the
-        gateway and its messaging control plane)."""
+        sourced, user tools on PATH), wrapped in a transient systemd scope whenever the
+        Linux user manager is reachable.  The scope is both a memory boundary and a
+        durable kill handle: an OOM or abandoned CLI session affects only this worker,
+        not the host, gateway, or unrelated services."""
         argv = [_find_shell(), "-lic", f"set +m; {safe_command}"]
         # This applies to both pipe mode and the PTY path above. See #70716.
-        in_supervised_gateway = _IS_LINUX and _is_supervised_gateway_process()
-        if in_supervised_gateway and _systemd_run_user_scope_available():
+        if _IS_LINUX and _systemd_run_user_scope_available():
             session.systemd_unit = f"hermes-worker-{unit_suffix}.scope"
             return _build_systemd_scope_argv(argv, unit_suffix=unit_suffix)
-        if in_supervised_gateway:
-            # Under a supervisor but no private cgroup: a worker OOM can still take
-            # the whole gateway down.
-            logger.debug(
-                "%s background executor not isolated in a systemd scope "
-                "(systemd-run --user unavailable); worker shares the gateway cgroup.", label)
+        if _IS_LINUX:
+            # Never turn a failed containment probe into an unbounded launch.  The
+            # caller may retry after the user manager becomes reachable (the probe's
+            # negative result expires), but this invocation is fail-closed.
+            raise RuntimeError(
+                f"{label} background process refused: systemd-run --user --scope "
+                "is unavailable, so no verified memory boundary can be applied"
+            )
         return argv
 
     @staticmethod
