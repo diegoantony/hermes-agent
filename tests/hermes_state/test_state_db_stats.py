@@ -238,6 +238,44 @@ def test_render_large_db_legacy_trigram_suggests_optimize():
     assert "optimize-storage" in blob
 
 
+def test_render_large_db_with_auto_prune_on_is_not_a_warning():
+    """auto_prune already on: advising to enable it is false; size is retention history -> info only."""
+    from hermes_cli.doctor_state import STATE_DB_SIZE_WARN_BYTES, _render_state_db_stats
+    from hermes_state_common import FTS_STORAGE_VERSION
+
+    big = STATE_DB_SIZE_WARN_BYTES + 1
+    lines = _render_state_db_stats(
+        _base_stats(logical_size_bytes=big, fts_storage_version=FTS_STORAGE_VERSION), holders=None,
+        sessions_cfg={"auto_prune": True, "retention_days": 90},
+    )
+    size_rows = [line for line in lines if "is large" in line[1]]
+    assert size_rows and all(kind == "info" for kind, *_ in size_rows)
+    blob = " ".join(" ".join(str(p) for p in line) for line in size_rows)
+    assert "consider enabling" not in blob
+    assert "retention_days=90" in blob
+
+
+def test_render_large_db_with_auto_prune_off_still_warns():
+    from hermes_cli.doctor_state import STATE_DB_SIZE_WARN_BYTES, _render_state_db_stats
+
+    big = STATE_DB_SIZE_WARN_BYTES + 1
+    for cfg in (None, {}, {"auto_prune": False}):
+        lines = _render_state_db_stats(_base_stats(logical_size_bytes=big), holders=None, sessions_cfg=cfg)
+        assert any(k == "warn" and "consider enabling sessions.auto_prune" in d for k, _t, d in lines), cfg
+
+
+def test_render_large_db_auto_prune_on_but_stale_fts_still_warns_optimize():
+    from hermes_cli.doctor_state import STATE_DB_SIZE_WARN_BYTES, _render_state_db_stats
+
+    big = STATE_DB_SIZE_WARN_BYTES + 1
+    lines = _render_state_db_stats(
+        _base_stats(logical_size_bytes=big, fts_rebuild_pending=True), holders=None,
+        sessions_cfg={"auto_prune": True},
+    )
+    warns = [d for k, _t, d in lines if k == "warn" and "is large" in _t]
+    assert warns and "optimize-storage" in warns[0] and "consider enabling" not in warns[0]
+
+
 
 
 
