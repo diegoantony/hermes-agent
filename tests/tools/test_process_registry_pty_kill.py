@@ -29,7 +29,11 @@ _KILL_DEADLINE_S = 5
 @pytest.fixture
 def unscoped(monkeypatch):
     # No systemd scope: stopping one would reap the escapee and hide the hang.
-    monkeypatch.setattr(module, "_is_supervised_gateway_process", lambda: False)
+    # The scope gate is `_systemd_run_user_scope_available()` for every local executor
+    # (CLI and gateway alike) since 7479fa78c2; `_is_supervised_gateway_process` no
+    # longer gates scoping at all, so patching it here would be a no-op on hosts where
+    # systemd-run --user is actually reachable (this escapee test needs it off).
+    monkeypatch.setattr(module, "_systemd_run_user_scope_available", lambda: False)
 
 
 def _wait_for(predicate, timeout):
