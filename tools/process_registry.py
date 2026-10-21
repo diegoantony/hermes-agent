@@ -166,19 +166,102 @@ def _worker_memory_max_bytes() -> int:
     return min(override_bound, safe_bound) if override_bound else safe_bound
 
 
-def _systemd_scope_argv(binary: str, unit_name: str, *argv: str) -> List[str]:
-    """``systemd-run --user --scope`` argv shared by the probe and real spawns.
+def _systemd_scope_argv(binary: str, unit_name: str, *argv: str, user: bool = True) -> List[str]:
+    """``systemd-run [--user] --scope`` argv shared by the probe and real spawns.
     ``--collect`` self-cleans the scope after exit; ``--unit`` names it for systemctl.
+    ``user=False`` targets the system manager (containment-ladder rung 3, root only).
     No ``OOMPolicy=``: transient scopes reject it on systemd <253 (#102486)."""
     memory_max = _worker_memory_max_bytes()
     memory_swap_max = min(memory_max, _WORKER_MEMORY_SWAP_MAX_CAP_BYTES)
     return [
-        binary, "--user", "--scope", "--quiet", "--unit", unit_name, "--collect",
+        binary, *(["--user"] if user else []), "--scope", "--quiet", "--unit", unit_name, "--collect",
         "--property", "MemoryAccounting=yes",
         "--property", f"MemoryMax={memory_max}",
         "--property", f"MemorySwapMax={memory_swap_max}",
         "--", *argv,
     ]
+
+
+# --- containment ladder fallbacks (see ProcessRegistry._scope_argv) -------------------
+# Rung 3 scopes live on the system manager; the prefix tells _stop_systemd_unit which
+# manager owns a unit (also after a checkpoint recovery, where only the name survives).
+_SYSTEM_SCOPE_PREFIX = "hermes-sysworker-"
+_ULIMIT_SHELLS = frozenset({"bash", "sh", "dash", "zsh", "ksh"})
+_SYSTEM_SCOPE_AVAILABLE: Optional[bool] = None
+_SYSTEM_SCOPE_PROBED_AT = 0.0
+_USER_MANAGER_REPAIR_COOLDOWN_SECONDS = 600.0
+_USER_MANAGER_REPAIRED_AT = 0.0
+_containment_warned: set = set()
+
+
+def _which(name: str) -> Optional[str]:
+    import shutil
+
+    return shutil.which(name)
+
+
+def _warn_containment_once(rung: str, detail: str) -> None:
+    """One loud warning per degraded rung per process (the verdict is host-level)."""
+    if rung in _containment_warned:
+        return
+    _containment_warned.add(rung)
+    logger.warning("background containment degraded to %s: %s", rung, detail)
+
+
+def _systemd_run_system_scope_available() -> bool:
+    """Rung 3: can root create a transient scope on the system manager? Cached like rung 1."""
+    global _SYSTEM_SCOPE_AVAILABLE, _SYSTEM_SCOPE_PROBED_AT
+    with _SYSTEMD_SCOPE_PROBE_LOCK:
+        fresh = time.monotonic() - _SYSTEM_SCOPE_PROBED_AT < _SYSTEMD_SCOPE_PROBE_TTL_SECONDS
+        if _SYSTEM_SCOPE_AVAILABLE is not None and fresh:
+            return _SYSTEM_SCOPE_AVAILABLE
+        available = False
+        binary = _which("systemd-run")
+        if _IS_LINUX and binary and os.geteuid() == 0:  # windows-footgun: ok — behind the _IS_LINUX check
+            try:
+                probe_unit = f"{_SYSTEM_SCOPE_PREFIX}probe-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+                result = subprocess.run(
+                    _systemd_scope_argv(binary, probe_unit, "/bin/sh", "-c", "exit 0", user=False),
+                    capture_output=True, timeout=3)
+                available = result.returncode == 0
+            except Exception as exc:
+                logger.debug("systemd-run --scope (system) probe error: %s", exc)
+        _SYSTEM_SCOPE_AVAILABLE = available
+        _SYSTEM_SCOPE_PROBED_AT = time.monotonic()
+        return available
+
+
+def _repair_user_manager_and_reprobe() -> bool:
+    """Rung 2: self-heal the per-user systemd manager, then re-probe rung 1.
+
+    Root only (it owns ``user@<uid>.service``); at most once per cooldown so a host that
+    cannot heal does not hammer systemd on every spawn.  Ensures linger first so the
+    manager survives the session that started it, then ``start`` (never ``restart``):
+    restarting a live manager would tear down every running worker scope, while
+    ``start`` is a no-op on an active manager and only revives a stopped one."""
+    global _USER_MANAGER_REPAIRED_AT, _SYSTEMD_SCOPE_AVAILABLE
+    if not _IS_LINUX or os.geteuid() != 0:  # windows-footgun: ok — behind the _IS_LINUX check
+        return False
+    now = time.monotonic()
+    if _USER_MANAGER_REPAIRED_AT and now - _USER_MANAGER_REPAIRED_AT < _USER_MANAGER_REPAIR_COOLDOWN_SECONDS:
+        return False
+    _USER_MANAGER_REPAIRED_AT = now
+    uid = os.getuid()  # windows-footgun: ok — behind the _IS_LINUX check
+    loginctl, systemctl = _which("loginctl"), _which("systemctl")
+    try:
+        if loginctl:
+            subprocess.run([loginctl, "enable-linger", str(uid)], capture_output=True, timeout=10)
+        if systemctl:
+            subprocess.run([systemctl, "start", f"user@{uid}.service"], capture_output=True, timeout=30)
+    except Exception as exc:
+        logger.warning("user systemd manager self-heal failed: %s", exc)
+        return False
+    with _SYSTEMD_SCOPE_PROBE_LOCK:
+        _SYSTEMD_SCOPE_AVAILABLE = None  # force a fresh rung-1 probe
+    healed = _systemd_run_user_scope_available()
+    logger.warning("user systemd manager self-heal (linger + start user@%s): %s",
+                   uid, "recovered" if healed else "still unavailable")
+    return healed
 
 
 def _default_user_runtime_dir() -> Path:
@@ -472,9 +555,11 @@ def _stop_systemd_unit(unit_name: str) -> bool:
     binary = shutil.which("systemctl")
     if binary is None:
         return False
+    # Rung-3 scopes live on the system manager; everything else on the user manager.
+    scope_flag = [] if unit_name.startswith(_SYSTEM_SCOPE_PREFIX) else ["--user"]
     try:
         result = subprocess.run(
-            [binary, "--user", "stop", unit_name],
+            [binary, *scope_flag, "stop", unit_name],
             capture_output=True,
             timeout=15,
             stdin=subprocess.DEVNULL,
@@ -551,6 +636,7 @@ class ProcessSession:
     detached: bool = False                      # Recovered from checkpoint (no pipe)
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
     systemd_unit: str = ""                      # transient scope unit name when spawned under systemd-run
+    containment: str = ""                       # user-scope|system-scope|rlimit (Linux containment ladder rung)
     handoff_note: str = ""                      # why a subagent handed this process to its parent (rides the notice)
     persist_on_release: bool = False           # opt out of agent-lifecycle cleanup (release()/turn-abandon kill
                                                 # sweeps), per terminal(background=true, persist_on_release=true) (#41225)
@@ -1228,24 +1314,41 @@ class ProcessRegistry(ProcessCheckpointMixin):
 
     def _scope_argv(self, session: ProcessSession, safe_command: str, unit_suffix: str, label: str) -> List[str]:
         """Login-shell argv for *safe_command* (parity with LocalEnvironment: rc files
-        sourced, user tools on PATH), wrapped in a transient systemd scope whenever the
-        Linux user manager is reachable.  The scope is both a memory boundary and a
-        durable kill handle: an OOM or abandoned CLI session affects only this worker,
-        not the host, gateway, or unrelated services."""
+        sourced, user tools on PATH), always launched under a memory boundary on Linux.
+
+        Containment ladder (first rung that works wins; never an unbounded launch):
+        1. ``systemd-run --user --scope`` (cgroup with MemoryMax/MemorySwapMax);
+        2. self-heal: root restarts ``user@<uid>.service`` once, then re-probes rung 1;
+        3. ``systemd-run --scope`` on the *system* manager (root only), same properties;
+        4. per-process ``ulimit -v`` in the worker shell (no cgroup, no swap cap) with a
+           loud warning — degraded but still bounded, so work continues;
+        refused only if even rung 4 cannot be built (non-POSIX shell)."""
         argv = [_find_shell(), "-lic", f"set +m; {safe_command}"]
+        if not _IS_LINUX:
+            return argv
         # This applies to both pipe mode and the PTY path above. See #70716.
-        if _IS_LINUX and _systemd_run_user_scope_available():
+        if _systemd_run_user_scope_available() or _repair_user_manager_and_reprobe():
             session.systemd_unit = f"hermes-worker-{unit_suffix}.scope"
+            session.containment = "user-scope"
             return _build_systemd_scope_argv(argv, unit_suffix=unit_suffix)
-        if _IS_LINUX:
-            # Never turn a failed containment probe into an unbounded launch.  The
-            # caller may retry after the user manager becomes reachable (the probe's
-            # negative result expires), but this invocation is fail-closed.
+        if _systemd_run_system_scope_available():
+            session.systemd_unit = f"{_SYSTEM_SCOPE_PREFIX}{unit_suffix}.scope"
+            session.containment = "system-scope"
+            _warn_containment_once("system-scope", "user systemd manager unreachable; workers use system scopes")
+            return _systemd_scope_argv(_which("systemd-run") or "systemd-run",
+                                       session.systemd_unit[:-len(".scope")], *argv, user=False)
+        shell = os.path.basename(argv[0])
+        if shell not in _ULIMIT_SHELLS:
             raise RuntimeError(
-                f"{label} background process refused: systemd-run --user --scope "
-                "is unavailable, so no verified memory boundary can be applied"
-            )
-        return argv
+                f"{label} background process refused: no systemd scope is available and "
+                f"shell {shell!r} cannot apply ulimit, so no memory boundary can be applied")
+        limit_kib = _worker_memory_max_bytes() // 1024
+        session.containment = "rlimit"
+        _warn_containment_once(
+            "rlimit", "no systemd scope available (user and system); workers run with per-process "
+            f"ulimit -v {limit_kib} KiB only — no aggregate cgroup limit and no swap cap. "
+            "Fix: `loginctl enable-linger <user>` or restore systemd")
+        return [argv[0], "-lic", f"ulimit -v {limit_kib} || exit 125; set +m; {safe_command}"]
 
     @staticmethod
     def _spawn_env(env_vars: dict) -> dict:

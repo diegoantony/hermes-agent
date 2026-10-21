@@ -13,6 +13,7 @@ import pytest
 from unittest.mock import MagicMock, patch
 
 from tools.environments.local_env_policy import _HERMES_PROVIDER_ENV_FORCE_PREFIX
+import tools.process_registry as pr
 from tools.process_registry import (
     ProcessRegistry,
     ProcessSession,
@@ -28,16 +29,23 @@ def registry():
 
 
 @pytest.fixture(autouse=True)
-def _reset_systemd_scope_cache():
+def _reset_systemd_scope_cache(monkeypatch):
     """Reset the cached ``systemd-run --user --scope`` availability flag
     before each test so a probe run on a real systemd host (where
     ``INVOCATION_ID`` is set) doesn't leak into tests that mock
     ``subprocess.Popen``. Tests that exercise the probe directly reset the
-    cache themselves."""
+    cache themselves.
+
+    Containment-ladder rungs 2 (self-heal ``user@<uid>``) and 3 (system scope)
+    touch the real systemd when the suite runs as root; they are disabled by
+    default and re-enabled explicitly by the tests that exercise them."""
     import tools.process_registry as _pr
 
     original = _pr._SYSTEMD_SCOPE_AVAILABLE
     _pr._SYSTEMD_SCOPE_AVAILABLE = False
+    monkeypatch.setattr(_pr, "_repair_user_manager_and_reprobe", lambda: False)
+    monkeypatch.setattr(_pr, "_systemd_run_system_scope_available", lambda: False)
+    monkeypatch.setattr(_pr, "_containment_warned", set())
     yield
     _pr._SYSTEMD_SCOPE_AVAILABLE = original
 
@@ -2238,9 +2246,9 @@ class TestSystemdCgroupIsolation:
         assert session.systemd_unit == f"hermes-worker-{session.id}.scope"
 
     def test_falls_back_when_systemd_run_unavailable(self, registry, monkeypatch, _gateway_identity):
-        """Under a supervisor but without systemd-run, fall back to the
-        legacy ``start_new_session=True`` path (worker shares the gateway
-        cgroup)."""
+        """No systemd scope at all (user + system): the containment ladder ends at a
+        per-process ``ulimit -v`` — still bounded, never an unbounded launch, and
+        the work is not refused."""
         fake_popen, captured = self._fake_popen_capture()
 
         monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
@@ -2258,108 +2266,136 @@ class TestSystemdCgroupIsolation:
             patch("threading.Thread", return_value=MagicMock()),
             patch.object(registry, "_write_checkpoint"),
         ):
-            registry.spawn_local("echo hello", cwd="/tmp")
+            session = registry.spawn_local("echo hello", cwd="/tmp")
 
         argv = captured["argv"]
-        # No systemd-run wrapping — direct shell invocation.
-        assert argv == ["/bin/bash", "-lic", "set +m; echo hello"], argv
+        limit_kib = pr._worker_memory_max_bytes() // 1024
+        assert argv == [
+            "/bin/bash", "-lic", f"ulimit -v {limit_kib} || exit 125; set +m; echo hello",
+        ], argv
         assert captured["start_new_session"] is True
+        assert session.containment == "rlimit"
+        assert session.systemd_unit == ""
 
-    def test_falls_back_when_not_under_supervisor(self, registry, monkeypatch):
-        """CLI mode (no supervisor) must NOT wrap in a systemd scope even if
-        systemd-run is available — isolation is a gateway concern."""
+    @pytest.mark.platforms("linux")
+    def test_ladder_self_heals_user_manager_before_degrading(self, registry, monkeypatch):
+        """Rung 2: when the user manager is unreachable, one self-heal attempt that
+        recovers it puts the worker back in a normal user scope."""
         fake_popen, captured = self._fake_popen_capture()
-
         monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
-        monkeypatch.setattr(
-            "tools.process_registry._systemd_run_user_scope_available",
-            lambda: True,
-        )
-        monkeypatch.setattr(
-            "gateway.restart.is_gateway_supervisor_process",
-            lambda environ=None: False,
-        )
-
+        monkeypatch.setattr("tools.process_registry._systemd_run_user_scope_available", lambda: False)
+        healed = []
+        monkeypatch.setattr("tools.process_registry._repair_user_manager_and_reprobe",
+                            lambda: healed.append(1) or True)
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
         with (
             patch("subprocess.Popen", side_effect=fake_popen),
             patch("threading.Thread", return_value=MagicMock()),
             patch.object(registry, "_write_checkpoint"),
         ):
-            registry.spawn_local("echo hello", cwd="/tmp")
+            session = registry.spawn_local("echo hello", cwd="/tmp")
+        assert healed == [1]
+        assert captured["argv"][:3] == ["/usr/bin/systemd-run", "--user", "--scope"]
+        assert session.containment == "user-scope"
+        assert session.systemd_unit == f"hermes-worker-{session.id}.scope"
 
+    @pytest.mark.platforms("linux")
+    def test_ladder_uses_system_scope_when_user_manager_cannot_heal(self, registry, monkeypatch):
+        """Rung 3: root falls back to a *system* transient scope with the same limits,
+        and kill/cleanup targets the system manager for that unit."""
+        fake_popen, captured = self._fake_popen_capture()
+        monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
+        monkeypatch.setattr("tools.process_registry._systemd_run_user_scope_available", lambda: False)
+        monkeypatch.setattr("tools.process_registry._systemd_run_system_scope_available", lambda: True)
+        monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+        with (
+            patch("subprocess.Popen", side_effect=fake_popen),
+            patch("threading.Thread", return_value=MagicMock()),
+            patch.object(registry, "_write_checkpoint"),
+        ):
+            session = registry.spawn_local("echo hello", cwd="/tmp")
         argv = captured["argv"]
-        assert argv == ["/bin/bash", "-lic", "set +m; echo hello"], argv
+        assert argv[0] == "/usr/bin/systemd-run" and "--user" not in argv and "--scope" in argv
+        props = [argv[i + 1] for i, v in enumerate(argv[:-1]) if v == "--property"]
+        assert any(p.startswith("MemoryMax=") for p in props)
+        assert any(p.startswith("MemorySwapMax=") for p in props)
+        assert session.containment == "system-scope"
+        assert session.systemd_unit == f"hermes-sysworker-{session.id}.scope"
+
+        calls = []
+        monkeypatch.setattr(
+            "tools.process_registry.subprocess.run",
+            lambda argv, **kw: calls.append(argv) or MagicMock(returncode=0, stderr=b""))
+        assert pr._stop_systemd_unit(session.systemd_unit) is True
+        assert calls[-1] == ["/usr/bin/systemctl", "stop", session.systemd_unit]
+        assert pr._stop_systemd_unit("hermes-worker-x.scope") is True
+        assert calls[-1] == ["/usr/bin/systemctl", "--user", "stop", "hermes-worker-x.scope"]
+
+    def test_ladder_refuses_only_when_no_boundary_is_possible(self, registry, monkeypatch):
+        """Last resort: no scope and a shell that cannot apply ulimit → refuse."""
+        monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/usr/bin/fish")
+        monkeypatch.setattr("tools.process_registry._systemd_run_user_scope_available", lambda: False)
+        with patch("subprocess.Popen") as popen, pytest.raises(RuntimeError, match="no memory boundary"):
+            registry.spawn_local("echo hello", cwd="/tmp")
+        popen.assert_not_called()
+
+    @pytest.mark.platforms("linux")
+    def test_self_heal_never_restarts_a_live_user_manager(self, monkeypatch):
+        """Rung 2 must use ``systemctl start`` (no-op on an active manager): a restart
+        would kill every running worker scope. Also rate-limited by a cooldown."""
+        monkeypatch.undo()  # drop the autouse neutralisation for this test only
+        monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_AVAILABLE", False)
+        monkeypatch.setattr(pr, "_USER_MANAGER_REPAIRED_AT", 0.0)
+        monkeypatch.setattr(pr.os, "geteuid", lambda: 0)
+        monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+        monkeypatch.setattr(pr, "_systemd_run_user_scope_available", lambda: True)
+        calls = []
+        monkeypatch.setattr(pr.subprocess, "run", lambda argv, **kw: calls.append(argv) or MagicMock(returncode=0))
+        assert pr._repair_user_manager_and_reprobe() is True
+        uid = os.getuid()
+        assert ["/usr/bin/systemctl", "start", f"user@{uid}.service"] in calls
+        assert not any("restart" in c for c in calls)
+        assert pr._repair_user_manager_and_reprobe() is False  # cooldown: no second attempt
+        assert len(calls) == 2
+
+    def test_cli_is_scoped_too(self, registry, monkeypatch):
+        """Decision A (fork): isolation is not a gateway-only concern — a CLI/desktop
+        worker gets the same bounded user scope when the user manager is reachable."""
+        fake_popen, captured = self._fake_popen_capture()
+        monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
+        monkeypatch.setattr("tools.process_registry._systemd_run_user_scope_available", lambda: True)
+        monkeypatch.setattr("gateway.restart.is_gateway_supervisor_process", lambda environ=None: False)
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
+        with (
+            patch("subprocess.Popen", side_effect=fake_popen),
+            patch("threading.Thread", return_value=MagicMock()),
+            patch.object(registry, "_write_checkpoint"),
+        ):
+            session = registry.spawn_local("echo hello", cwd="/tmp")
+        argv = captured["argv"]
+        assert argv[:3] == ["/usr/bin/systemd-run", "--user", "--scope"], argv
+        assert argv[argv.index("--"):][-1] == "set +m; echo hello"
         assert captured["start_new_session"] is True
+        assert session.systemd_unit == f"hermes-worker-{session.id}.scope"
 
     @pytest.mark.parametrize("use_pty", [False, True])
-    def test_inherited_systemd_marker_does_not_scope_interactive_cli(
-        self, registry, monkeypatch, use_pty
+    @pytest.mark.parametrize("gateway_child", [False, True])
+    def test_inherited_markers_still_give_child_cli_its_own_scope_and_session(
+        self, registry, monkeypatch, use_pty, gateway_child
     ):
-        """A CLI inside a supervised terminal must keep workers off its tty.
-
-        INVOCATION_ID is inherited by every descendant, so its presence
-        alone must not activate the gateway-only systemd scope path.
-        """
-        monkeypatch.setenv("INVOCATION_ID", "herdr-service-inherited-marker")
-        monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
-        monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
-        monkeypatch.setattr(
-            "tools.process_registry._systemd_run_user_scope_available",
-            lambda: True,
-        )
-        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
-
-        if use_pty:
-            from ptyprocess import PtyProcess
-
-            fake_pty = MagicMock(pid=4321)
-            with (
-                patch.object(PtyProcess, "spawn", return_value=fake_pty) as pty_spawn,
-                patch("threading.Thread", return_value=MagicMock()),
-                patch.object(registry, "_write_checkpoint"),
-            ):
-                session = registry.spawn_local("codex", cwd="/tmp", use_pty=True)
-            assert pty_spawn.call_args.args[0] == [
-                "/bin/bash", "-lic", "set +m; codex",
-            ]
-        else:
-            fake_popen, captured = self._fake_popen_capture()
-            with (
-                patch("subprocess.Popen", side_effect=fake_popen),
-                patch("threading.Thread", return_value=MagicMock()),
-                patch.object(registry, "_write_checkpoint"),
-            ):
-                session = registry.spawn_local("echo hello", cwd="/tmp")
-            assert captured["argv"] == [
-                "/bin/bash", "-lic", "set +m; echo hello",
-            ]
-            assert captured["start_new_session"] is True
-
-        assert session.systemd_unit == ""
-
-    @pytest.mark.parametrize("use_pty", [False, True])
-    def test_inherited_gateway_tree_markers_do_not_scope_child_cli(
-        self, registry, monkeypatch, use_pty
-    ):
-        """Gateway descendants are not the gateway process that owns the PID file.
-
-        _HERMES_GATEWAY is inherited (and set by importing gateway.run), so
-        both it and INVOCATION_ID may be present in a child process. The
-        PID-ownership gate must still keep the scope path off.
-        """
+        """Inherited INVOCATION_ID / _HERMES_GATEWAY markers do not change the decision:
+        a CLI worker (PTY or pipe) is scoped, and the pipe path keeps start_new_session
+        so it never shares the TUI's foreground process group (#70716)."""
         monkeypatch.setenv("INVOCATION_ID", "inherited-systemd-marker")
-        monkeypatch.setenv("_HERMES_GATEWAY", "1")
-        monkeypatch.setattr(
-            "gateway.status.get_running_pid",
-            lambda *, cleanup_stale=False: os.getpid() + 1,
-        )
+        if gateway_child:
+            monkeypatch.setenv("_HERMES_GATEWAY", "1")
+            monkeypatch.setattr("gateway.status.get_running_pid",
+                                lambda *, cleanup_stale=False: os.getpid() + 1)
+        else:
+            monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
         monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
-        monkeypatch.setattr(
-            "tools.process_registry._systemd_run_user_scope_available",
-            lambda: True,
-        )
+        monkeypatch.setattr("tools.process_registry._systemd_run_user_scope_available", lambda: True)
         monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
-
         if use_pty:
             from ptyprocess import PtyProcess
 
@@ -2370,9 +2406,8 @@ class TestSystemdCgroupIsolation:
                 patch.object(registry, "_write_checkpoint"),
             ):
                 session = registry.spawn_local("codex", cwd="/tmp", use_pty=True)
-            assert pty_spawn.call_args.args[0] == [
-                "/bin/bash", "-lic", "set +m; codex",
-            ]
+            argv = pty_spawn.call_args.args[0]
+            assert argv[-1] == "set +m; codex"
         else:
             fake_popen, captured = self._fake_popen_capture()
             with (
@@ -2381,12 +2416,11 @@ class TestSystemdCgroupIsolation:
                 patch.object(registry, "_write_checkpoint"),
             ):
                 session = registry.spawn_local("echo hello", cwd="/tmp")
-            assert captured["argv"] == [
-                "/bin/bash", "-lic", "set +m; echo hello",
-            ]
+            argv = captured["argv"]
+            assert argv[-1] == "set +m; echo hello"
             assert captured["start_new_session"] is True
-
-        assert session.systemd_unit == ""
+        assert argv[:3] == ["/usr/bin/systemd-run", "--user", "--scope"], argv
+        assert session.systemd_unit == f"hermes-worker-{session.id}.scope"
 
     @pytest.mark.platforms("linux")
     def test_systemd_post_spawn_failure_never_kills_gateway_process_group(
