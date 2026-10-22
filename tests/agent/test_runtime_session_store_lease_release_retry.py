@@ -110,3 +110,44 @@ def test_cross_session_calls_stay_denied_after_the_change(tmp_path):
             store.refresh_session_turn_lease('other-session', 'holder')
     finally:
         store.close()
+
+
+def test_release_retry_preserves_permanent_owner_denial(tmp_path):
+    calls = []
+    def denied(method, **params):
+        calls.append(params)
+        raise WorkerPersistenceError('permission_denied')
+    store = RuntimeSessionStore(denied, {'session_id': 's'}, tmp_path / 'private')
+    try:
+        with pytest.raises(WorkerPersistenceError, match='permission_denied'):
+            store.queue_token_counts('s', input_tokens=1)
+        frozen = json.loads(json.dumps(store.journal['pending']))
+        with pytest.raises(WorkerPersistenceError, match='permission_denied'):
+            store.release_session_turn_lease('s', 'holder')
+        assert len(calls) == 2
+        assert calls[0] == calls[1], 'retry must preserve scope, sequence and payload'
+        assert store.journal['pending'] == frozen
+        assert store.failure == 'permission_denied'
+        assert not any(p['operation'] == 'turn.cleanup' for p in calls)
+    finally:
+        store._outbox_owner.close()
+
+
+def test_release_retry_on_continued_timeout_is_bounded_and_durable(tmp_path):
+    calls = []
+    def unavailable(method, **params):
+        calls.append(params)
+        raise TimeoutError('worker_receipt_timeout')
+    store = RuntimeSessionStore(unavailable, {'session_id': 's'}, tmp_path / 'private')
+    try:
+        with pytest.raises(TimeoutError, match='worker_receipt_timeout'):
+            store.queue_token_counts('s', input_tokens=1)
+        frozen = json.loads(json.dumps(store.journal['pending']))
+        with pytest.raises(WorkerPersistenceError, match='worker_receipt_timeout'):
+            store.release_session_turn_lease('s', 'holder')
+        assert len(calls) == 2, 'cleanup may retry once, never spin until owner returns'
+        assert calls[0] == calls[1]
+        assert store.journal['pending'] == frozen
+        assert json.loads(store.path.read_text())['pending'] == frozen
+    finally:
+        store._outbox_owner.close()
