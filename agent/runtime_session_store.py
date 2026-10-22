@@ -394,6 +394,23 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
 
     def release_session_turn_lease(self, session_id, holder):
         # DurableTurnLease retains its admission target across physical rotation.
+        #
+        # A release is the one call whose timely delivery outweighs the sticky-failure guard
+        # that otherwise protects ordered transcript/usage writes: an unreleased lease blocks
+        # every OTHER session/worker from this row until LEASE_TTL_SECONDS (5 minutes), while a
+        # missed transcript write only affects this one. So, unlike every other _apply() caller,
+        # a prior sticky self.failure does not short-circuit this call -- but only when there is
+        # an actual queued delivery failure to retry (self.journal['pending'] non-empty): calling
+        # retry_pending() with nothing queued would trivially clear self.failure without
+        # verifying anything, silently masking an unrelated local fault (disk/outbox). If the
+        # retry still can't reach the owner, self.failure is re-set to the fresh error and this
+        # falls through to the exact same raise as before -- no behaviour change on a genuine
+        # outage, and no bypass of _session()'s cross-session scope check (release never called
+        # it, and still doesn't).
+        with self.lock:
+            if self.failure is not None and self.journal['pending']:
+                with contextlib.suppress(Exception):
+                    self.retry_pending()
         self._apply('turn.cleanup', {'target': session_id, 'holder': holder})
 
     def queue_token_counts(self, session_id, **usage):
