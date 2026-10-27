@@ -41,6 +41,10 @@ DEFAULT_LOOP_WATCHDOG_TIMEOUT_S = 10.0
 # the loop it monitors) is fixed at the root by the off-loop heartbeat write + two-witness probe (#90502),
 # so the default stays tight for genuine wedges.
 DEFAULT_LOOP_WATCHDOG_MAX_STRIKES = 3
+# Wall-clock bound on a fired watchdog's own exit path (log, dumps, lifecycle stamps). Those steps
+# write to disk, and under the I/O starvation that wedges the loop in the first place they block
+# too: a host with multi-second fsyncs took 5-14 minutes from "watchdog fired" to process exit.
+DEFAULT_WATCHDOG_EXIT_BACKSTOP_S = 60.0
 _HEARTBEAT_RELATIVE = ("state", "gateway.heartbeat")
 _WATCHDOG_DUMP_RELATIVE = ("logs", "gateway-shutdown-watchdog.log")
 
@@ -123,21 +127,22 @@ def start_loop_liveness_watchdog(
                 continue
             if stop_event.is_set():
                 return
-            with contextlib.suppress(Exception):
-                logger.critical(
-                    "Gateway event loop missed %d consecutive liveness probes; dumping all thread "
-                    "stacks and exiting with code %d so the service supervisor can restart it.",
-                    strikes, exit_code)
-            # File + stderr: a console-less launcher (Windows .vbs login item) discards stderr, so a
-            # liveness death used to leave no stack anywhere (#120356, #91097).
-            _write_watchdog_dump(
-                get_shutdown_watchdog_dump_path(), delay_s=probe_timeout * strikes,
-                snapshot={"strikes": strikes, "probe_interval_s": probe_interval},
-                event="loop_liveness_watchdog_fired")
-            if stop_event.is_set():
-                return
-            _mark_exited_quietly(exit_code, "loop_liveness_watchdog")
-            _hard_exit(exit_code)
+            with _exit_backstop():
+                with contextlib.suppress(Exception):
+                    logger.critical(
+                        "Gateway event loop missed %d consecutive liveness probes; dumping all thread "
+                        "stacks and exiting with code %d so the service supervisor can restart it.",
+                        strikes, exit_code)
+                # File + stderr: a console-less launcher (Windows .vbs login item) discards stderr, so a
+                # liveness death used to leave no stack anywhere (#120356, #91097).
+                _write_watchdog_dump(
+                    get_shutdown_watchdog_dump_path(), delay_s=probe_timeout * strikes,
+                    snapshot={"strikes": strikes, "probe_interval_s": probe_interval},
+                    event="loop_liveness_watchdog_fired")
+                if stop_event.is_set():
+                    return
+                _mark_exited_quietly(exit_code, "loop_liveness_watchdog")
+                _hard_exit(exit_code)
     thread = threading.Thread(target=_watchdog, daemon=True, name="gateway-loop-liveness-watchdog")
     try:
         thread.start()
@@ -145,6 +150,33 @@ def start_loop_liveness_watchdog(
         logger.debug("Failed to start gateway loop liveness watchdog", exc_info=True)
         return None
     return _LoopLivenessWatchdogHandle(stop_event, thread)
+
+
+_backstop_sink = None  # faulthandler keeps only the fd: the file object must outlive the timer
+
+
+@contextlib.contextmanager
+def _exit_backstop(timeout: Optional[float] = None):
+    """Bound a fired watchdog's exit path: if the block has not ``os._exit``-ed within *timeout*,
+    faulthandler's C watchdog thread ``_exit(1)``s the process. A Python thread cannot be the
+    backstop: ``faulthandler.dump_traceback`` writes with the GIL held, so a dump stuck on a starved
+    disk starves every Python thread with it. The timer's own dump goes to the null device for the
+    same reason (the stacks are already in the dump file or on stderr, or the disk is what hangs).
+    Leaving the block without exiting (a late ``stop()``, a patched exit in tests) disarms it."""
+    global _backstop_sink
+    armed = False
+    with contextlib.suppress(Exception):
+        if _backstop_sink is None:
+            _backstop_sink = open(os.devnull, "wb")  # process-lifetime: the C timer holds its fd
+        faulthandler.dump_traceback_later(
+            DEFAULT_WATCHDOG_EXIT_BACKSTOP_S if timeout is None else timeout, exit=True, file=_backstop_sink)
+        armed = True
+    try:
+        yield
+    finally:
+        if armed:
+            with contextlib.suppress(Exception):
+                faulthandler.cancel_dump_traceback_later()
 
 
 def _hard_exit(exit_code: int) -> None:
@@ -280,32 +312,33 @@ def arm_shutdown_watchdog(
                 return
         if done.is_set():
             return
-        try:
-            snapshot = snapshot_fn() if snapshot_fn is not None else None
-        except Exception as exc:
-            snapshot = {"snapshot_error": repr(exc)}
-        target = dump_path if dump_path is not None else get_shutdown_watchdog_dump_path()
-        _write_watchdog_dump(target, delay_s=delay, snapshot=snapshot)
-        with contextlib.suppress(Exception):
-            logger.critical("Shutdown watchdog fired after %.0fs — forcing process exit "
-                            "(asyncio drain path appears wedged; see %s)", delay, target)
-        for stream in (sys.stdout, sys.stderr):
+        with _exit_backstop():
+            try:
+                snapshot = snapshot_fn() if snapshot_fn is not None else None
+            except Exception as exc:
+                snapshot = {"snapshot_error": repr(exc)}
+            target = dump_path if dump_path is not None else get_shutdown_watchdog_dump_path()
+            _write_watchdog_dump(target, delay_s=delay, snapshot=snapshot)
             with contextlib.suppress(Exception):
-                stream.flush()
-        # Mirror _exit_after_graceful_shutdown: release PID file + runtime lock BEFORE the log drain
-        # (never strand locks), then drain the log queue so logger.critical lands before os._exit.
-        with contextlib.suppress(Exception):
+                logger.critical("Shutdown watchdog fired after %.0fs — forcing process exit "
+                                "(asyncio drain path appears wedged; see %s)", delay, target)
+            for stream in (sys.stdout, sys.stderr):
+                with contextlib.suppress(Exception):
+                    stream.flush()
             # Mirror _exit_after_graceful_shutdown: release PID file + runtime lock BEFORE the log drain
-            # (locks must never be stranded), then drain the async log queue so the logger.critical above
-            # actually reaches the file before os._exit bypasses atexit. (#66892)
-            from gateway.status import remove_pid_file, release_gateway_runtime_lock
-            remove_pid_file()
-            release_gateway_runtime_lock()
-        with contextlib.suppress(Exception):
-            from hermes_logging import drain_log_queue
-            drain_log_queue(timeout=1.0)
-        _mark_exited_quietly(exit_code, "shutdown_watchdog")
-        _hard_exit(exit_code)
+            # (never strand locks), then drain the log queue so logger.critical lands before os._exit.
+            with contextlib.suppress(Exception):
+                # Mirror _exit_after_graceful_shutdown: release PID file + runtime lock BEFORE the log drain
+                # (locks must never be stranded), then drain the async log queue so the logger.critical above
+                # actually reaches the file before os._exit bypasses atexit. (#66892)
+                from gateway.status import remove_pid_file, release_gateway_runtime_lock
+                remove_pid_file()
+                release_gateway_runtime_lock()
+            with contextlib.suppress(Exception):
+                from hermes_logging import drain_log_queue
+                drain_log_queue(timeout=1.0)
+            _mark_exited_quietly(exit_code, "shutdown_watchdog")
+            _hard_exit(exit_code)
     try:
         threading.Thread(target=_watchdog, daemon=True, name=name).start()
     except Exception:
