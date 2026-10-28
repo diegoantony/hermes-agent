@@ -398,6 +398,28 @@ class CLIAgentSetupMixin:
                 if _fb_api_key:
                     _fb_kwargs["explicit_api_key"] = _fb_api_key
                 runtime = resolve_runtime_provider(**_fb_kwargs)
+                # The ladder can resolve a different provider identity than the entry declared
+                # (named-custom entries resolve to the bare "custom" class; see
+                # fallback_config.effective_runtime_provider). _ensure_runtime_credentials sets
+                # self.provider straight from runtime["provider"], so an un-reconciled value here
+                # is exactly how self.model lands on the fallback entry while self.provider/base_url
+                # stay on a DIFFERENT provider than the model was ever validated against — the
+                # entry's declared identity must win, matching resolve_runtime_with_fallback (the
+                # gateway/oneshot shared resolver) instead of diverging from it (#139155-cli).
+                from hermes_cli.fallback_config import effective_runtime_provider
+                runtime["provider"] = effective_runtime_provider(_fb, runtime) or _fb_provider
+                from hermes_cli.auth import _plugin_aliases
+                _fb_provider_canonical = _plugin_aliases().get(_fb_provider, _fb_provider)
+                if runtime["provider"] != _fb_provider_canonical and _fb_provider != "custom":
+                    # The ladder resolved a provider the entry never declared (e.g. an OAuth/env
+                    # rung silently fell through to a different built-in provider): sending the
+                    # entry's model there is exactly the incoherent pair that 404s against the
+                    # wrong endpoint — this resolution is not usable, try the next chain entry.
+                    logger.warning(
+                        "Fallback entry %s/%s resolved to provider %r instead; refusing the "
+                        "incoherent pair and trying the next fallback entry",
+                        _fb_provider, _fb_model, runtime["provider"])
+                    continue
                 _why_log, _why = primary_failure_wording(primary_exc)  # #117482: quota is not auth
                 logger.warning(
                     "Primary provider %s (%s). Falling through to fallback: %s/%s",

@@ -348,6 +348,44 @@ def test_fallback_runtime_resolves_the_fallback_entry_model(monkeypatch, tmp_pat
     assert runtime["base_url"] == "https://opencode.ai/zen/go/v1"
 
 
+def test_fallback_runtime_rejects_provider_model_incoherent_pair(monkeypatch, tmp_path):
+    """Reproduces #139155-cli: the pool/oauth ladder resolving a DIFFERENT provider than the
+    fallback entry declared (e.g. a stale caller resolving straight through to the primary's
+    anthropic runtime while asked to resolve openai-codex) must never leave
+    self.model == the fallback entry's model paired with a provider the model was never
+    validated against — that pair is exactly what sends gpt-5.6-sol to api.anthropic.com and
+    gets HTTP 404 back three times. _resolve_fallback_runtime must refuse the entry rather than
+    hand back the incoherent pair."""
+    from hermes_cli.auth import AuthError
+    from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr("cli._cprint", lambda *a, **k: None, raising=False)
+    # The ladder claims success but — like a stale/benched codex OAuth login silently falling
+    # through to the configured anthropic env runtime — hands back a DIFFERENT provider/base_url
+    # than the "openai-codex" the fallback entry declared.
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **kw: {
+            "provider": "anthropic", "api_mode": "anthropic_messages",
+            "base_url": "https://api.anthropic.com", "api_key": "sk-ant-test",
+        },
+    )
+
+    shell = CLIAgentSetupMixin.__new__(CLIAgentSetupMixin)
+    shell._fallback_model = [{"provider": "openai-codex", "model": "gpt-5.6-sol"}]
+    runtime = shell._resolve_fallback_runtime(
+        AuthError("rate limited", provider="anthropic", code="rate_limited"))
+
+    # The chain is exhausted (one bad entry, nothing else to try): no runtime should be returned,
+    # and self.model must NEVER have been swapped to the fallback model while runtime/self.provider
+    # stayed on the anthropic endpoint — an incoherent pair would 404 against api.anthropic.com.
+    assert runtime is None
+    assert getattr(shell, "model", None) != "gpt-5.6-sol"
+
+
 def _quota_auth_error():
     from hermes_cli.auth import CODEX_RATE_LIMITED_CODE, AuthError
     return AuthError(
