@@ -7,6 +7,7 @@ to match the claim-time fingerprint is not proof of death. Terminal states are i
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
 import os
@@ -34,9 +35,52 @@ MAX_TERMINAL_EXECUTIONS = 1000
 HANDOFF_ADOPTION_GRACE_SECONDS = 30.0
 # Floor for the live-owner stale-claim bound (#115692); see _live_owner_stale_after_seconds.
 LIVE_OWNER_STALE_CLAIM_FLOOR_SECONDS = 7200.0
+# Matches cron/jobs.py's _JOBS_LOCK_TIMEOUT_SECONDS (30s): the ledger must tolerate contention
+# at least as long as the jobs-file flock does. A busy host fsync measured at 2.8-7.9s (t_91db9281)
+# exceeded the previous 5000ms default, so every writer that lost the race raised
+# 'database is locked' instead of waiting it out.
+EXECUTIONS_BUSY_TIMEOUT_MS = 30_000
+# A few short retries on top of the busy_timeout above: PRAGMA busy_timeout covers one connection's
+# wait inside a single statement, but a slow host can also fail the *second* statement of a
+# transaction (e.g. the COMMIT's fsync) after the first one already waited out its budget. Only a
+# locked/busy error is transient; anything else (corruption, disk full) must still raise at once.
+_LEDGER_LOCK_RETRY_ATTEMPTS = 4
+_LEDGER_LOCK_RETRY_BASE_SECONDS = 0.25
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
+
+
+def _is_transient_lock_error(exc: BaseException) -> bool:
+    return isinstance(exc, sqlite3.OperationalError) and (
+        "locked" in str(exc).lower() or "busy" in str(exc).lower()
+    )
+
+
+def _with_lock_retry(fn):
+    """Retry a ledger write a few times on a transient 'database is locked'/'busy' that
+    outlives the connection's busy_timeout. See ``EXECUTIONS_BUSY_TIMEOUT_MS`` above and
+    t_91db9281: the busy_timeout already waits out most contention, this is defense in depth
+    for the rare stall that still exceeds it, so create/adopt/finish do not abandon a row
+    mid-transition just because one write lost a race."""
+
+    @functools.wraps(fn)
+    def _wrapper(*args, **kwargs):
+        attempt = 0
+        while True:
+            try:
+                return fn(*args, **kwargs)
+            except sqlite3.OperationalError as exc:
+                attempt += 1
+                if not _is_transient_lock_error(exc) or attempt >= _LEDGER_LOCK_RETRY_ATTEMPTS:
+                    raise
+                logger.warning(
+                    "cron/executions.db: %s retrying after transient lock (attempt %d/%d): %s",
+                    fn.__name__, attempt, _LEDGER_LOCK_RETRY_ATTEMPTS, exc,
+                )
+                time.sleep(_LEDGER_LOCK_RETRY_BASE_SECONDS * (2 ** (attempt - 1)))
+
+    return _wrapper
 
 
 # --- executions ledger --------------------------------------------------------------------------
@@ -50,7 +94,10 @@ def _connect() -> sqlite3.Connection:
 
     path = EXECUTIONS_FILE or (get_hermes_home().resolve() / "cron" / "executions.db")
     _ensure_cron_dir(path.parent)
-    return open_db(path, db_label="cron/executions.db", synchronous_full=True, initialize=_initialize_schema)
+    return open_db(
+        path, db_label="cron/executions.db", synchronous_full=True,
+        busy_timeout_ms=EXECUTIONS_BUSY_TIMEOUT_MS, initialize=_initialize_schema,
+    )
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
@@ -210,6 +257,7 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
     )
 
 
+@_with_lock_retry
 def create_execution(
     job_id: str, *, source: str, scheduled_instant: Optional[str] = None,
 ) -> dict[str, Any]:
@@ -247,6 +295,7 @@ def set_execution_occurrence(execution_id: str, instant: Optional[str]) -> None:
             raise RuntimeError("Cron occurrence could not be bound before dispatch")
 
 
+@_with_lock_retry
 def mark_execution_handoff_pending(execution_id: str) -> Optional[dict[str, Any]]:
     """Fence restart recovery while an external worker is adopting a claim."""
     with _transaction() as conn:
@@ -264,6 +313,7 @@ def mark_execution_handoff_pending(execution_id: str) -> Optional[dict[str, Any]
     return record
 
 
+@_with_lock_retry
 def adopt_claimed_execution(execution_id: str) -> Optional[dict[str, Any]]:
     """Atomically transfer and start an attempt in its worker process.
 
@@ -290,6 +340,7 @@ def adopt_claimed_execution(execution_id: str) -> Optional[dict[str, Any]]:
     return record
 
 
+@_with_lock_retry
 def mark_execution_running(execution_id: str) -> Optional[dict[str, Any]]:
     """Transition one claimed attempt to running exactly once."""
     now = _hermes_now().isoformat()
@@ -309,6 +360,7 @@ def mark_execution_running(execution_id: str) -> Optional[dict[str, Any]]:
     return record
 
 
+@_with_lock_retry
 def finish_execution(
     execution_id: str, *, success: bool, error: Optional[str] = None,
     delivery_outcome: Optional[str] = None,
@@ -442,10 +494,9 @@ def recover_interrupted_executions() -> int:
                WHERE status IN ('claimed','running')"""
         ).fetchall()
         for row in rows:
-            if row["process_id"] == _PROCESS_ID:
-                continue
+            same_process = row["process_id"] == _PROCESS_ID
             reason = _OWNER_GONE_REASON
-            if _owner_is_live(int(row["pid"]), row["process_started_at"]):
+            if same_process or _owner_is_live(int(row["pid"]), row["process_started_at"]):
                 # A live owner is normally a legitimately running job. A worker permanently
                 # deadlocked (e.g. futex_wait behind a route/proxy flip, #115692) also passes
                 # this check, so a claim SILENT for longer than the derived bound is treated
@@ -454,8 +505,16 @@ def recover_interrupted_executions() -> int:
                 # the owner's last ``progress_at`` stamp (the run monitor refreshes it while
                 # the agent is active), so a healthy multi-hour run is never reclaimed while
                 # it is still working. The wedged worker PROCESS is NOT terminated here
-                # (leaked until host restart); rows owned by this process (process_id ==
-                # _PROCESS_ID, in-process runs) are skipped above and remain out of scope.
+                # (leaked until host restart).
+                #
+                # A row owned by THIS process (same_process) is normally still being handled
+                # by its own in-flight call stack and does not need this sweep — but if that
+                # call stack's own settling write (finish_execution/adopt_claimed_execution)
+                # itself raised under lock contention (t_91db9281) the row is abandoned with
+                # no other recovery path, since every other owner-liveness check in this
+                # module treats "owned by me" as proof of life. The SAME staleness bound
+                # therefore also applies here instead of skipping forever, so a same-process
+                # orphan eventually clears without requiring a gateway restart.
                 if not stale_after_resolved:
                     stale_after = _live_owner_stale_after_seconds()
                     stale_after_resolved = True
@@ -464,6 +523,10 @@ def recover_interrupted_executions() -> int:
                     or _stale_age_seconds(row["claimed_at"], row["progress_at"]) <= stale_after
                 ):
                     continue
+                # This branch only runs for a live owner (same-process rows are live by
+                # construction: this very code is that process), so the truthful cause is
+                # always "wedged", never "scheduler restarted" (that implies a restart that
+                # did not happen).
                 reason = _OWNER_WEDGED_REASON
             handoff_started_at = row["handoff_started_at"]
             if (
