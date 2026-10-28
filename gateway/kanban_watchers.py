@@ -10,6 +10,7 @@ in ``kanban_watchers_common``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import time
 from pathlib import Path
@@ -310,6 +311,11 @@ class GatewayKanbanWatchersMixin:
                     ready_pending = await _to_thread_process_service(dispatcher.ready_nonempty)
                     bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
                 now = int(time.time())
+                if bad_ticks >= _HEALTH_WINDOW:
+                    with contextlib.suppress(Exception):
+                        alerted = await _to_thread_process_service(dispatcher.alert_stuck_tasks)
+                        if alerted:
+                            logger.info("kanban dispatcher: emitted dispatcher_stuck alert for %s", alerted)
                 if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
                     held = _kbd.describe_suppression(res for _slug, res in (results or []))
                     logger.warning(

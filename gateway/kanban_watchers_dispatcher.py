@@ -244,6 +244,33 @@ class _KanbanDispatcher:
                             conn.close()
         return False
 
+    def alert_stuck_tasks(self) -> list[str]:
+        """Scan every board for ``ready`` tasks diagnosed ``stranded_in_ready``
+        (error/critical) and emit a ``dispatcher_stuck`` event so the existing
+        notifier delivers it to any subscribed card/chat — the durable half of
+        the embedded dispatcher's health check (see ``kanban_db_dispatch.
+        scan_and_alert_stuck_ready_tasks``). Best-effort per board; one
+        board's failure must not block the rest. Returns every alerted
+        ``(board, task_id)`` pair as ``"board:task_id"`` strings.
+        """
+        kbd = _kbd()
+        from hermes_cli import kanban_db as _kb
+        alerted: list[str] = []
+        with _kb.pin_first_board_resolution():
+            for slug in self._board_slugs():
+                conn = None
+                try:
+                    conn = _kbc().connect(board=slug)
+                    for task_id in kbd.scan_and_alert_stuck_ready_tasks(conn):
+                        alerted.append(f"{slug}:{task_id}")
+                except Exception:
+                    logger.exception("kanban dispatcher: stuck-task alert scan failed on board %s", slug)
+                finally:
+                    if conn is not None:
+                        with contextlib.suppress(Exception):
+                            conn.close()
+        return alerted
+
     def auto_decompose_tick(self, auto_decompose_per_tick: int) -> int:
         """Auto-decompose up to N triage tasks across all boards into ready workgraphs.
 

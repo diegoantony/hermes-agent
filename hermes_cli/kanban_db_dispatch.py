@@ -67,6 +67,16 @@ _RESPAWN_BLOCKER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Outcomes that end a run as a deliberate hand-off rather than a failure: the
+# worker chose to stop (dependency wait, parked for a human, rescheduled, sent
+# back for rework). Any of these superseding an older run's stamped text means
+# that text is history, not today's diagnosis — the #117097 crash exception
+# generalised. Does NOT include "crashed" (handled separately above) nor
+# terminal/failure outcomes ("spawn_failed", "stale", "reclaimed", "gave_up",
+# "timed_out", "rate_limited") which must still reach blocker_auth when their
+# own text matches.
+_HANDOFF_RUN_OUTCOMES = frozenset({"blocked", "scheduled", "changes_requested"})
+
 # Within this window a completed run counts as "recent proof"; don't re-spawn.
 _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 
@@ -1617,10 +1627,18 @@ def check_respawn_guard(
     # 2. Quota / auth blocker: retrying immediately will not help.  A plain
     # crash is different: its persisted error includes the worker's last
     # captured output, which is context rather than a diagnosis and may contain
-    # benign commands such as ``claude auth status`` (#117097).
+    # benign commands such as ``claude auth status`` (#117097).  So is a newer
+    # run that ENDED as a deliberate hand-off: the worker got past whatever an
+    # older run stamped, so that text is history — trusting it parked a
+    # dependency-promoted card in ``ready`` forever.
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
-    if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
+    if (
+        err
+        and latest_outcome != "crashed"
+        and latest_outcome not in _HANDOFF_RUN_OUTCOMES
+        and _RESPAWN_BLOCKER_RE.search(err)
+    ):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
@@ -1656,6 +1674,67 @@ def check_respawn_guard(
         return "active_pr"
 
     return None
+
+
+# Re-alert the same task at most this often — the condition that trips
+# ``_rule_stranded_in_ready`` (ready, assigned, unclaimed) is itself durable
+# until something claims the card, so without a cooldown every dispatcher
+# tick would emit a fresh event.
+_STUCK_ALERT_COOLDOWN_SECONDS = 1800  # 30 minutes
+
+
+def scan_and_alert_stuck_ready_tasks(
+    conn: sqlite3.Connection, *, now: Optional[int] = None, config: Optional[dict] = None,
+) -> list[str]:
+    """Turn the ``stranded_in_ready`` diagnostic into a durable, deliverable event.
+
+    Before this, "Ready for Nh with no worker" was PULL-only: visible in
+    ``hermes kanban diagnostics`` / the dashboard, and mirrored as a bare log
+    line by the embedded dispatcher's health check — nothing routed it
+    anywhere a human would see it without going looking (field incident,
+    t_b16460c8: a card sat in ``ready`` 40h while the log warned every 5
+    minutes). ``kanban_watchers_notifier.TERMINAL_KINDS`` already pushes a
+    kanban event to any chat/card subscribed to the task — adding
+    ``dispatcher_stuck`` to that list is the whole delivery path; this
+    function only decides WHEN to emit one, rate-limited by
+    ``_STUCK_ALERT_COOLDOWN_SECONDS`` per task so a tick-driven caller can run
+    it every cycle without spamming. Returns the alerted task ids.
+    """
+    from hermes_cli import kanban_diagnostics as kd
+
+    if now is None:
+        now = int(time.time())
+    diag_config = config if config is not None else {}
+    rows = conn.execute("SELECT * FROM tasks WHERE status = 'ready'").fetchall()
+    alerted: list[str] = []
+    for row in rows:
+        task_id = row["id"]
+        events = conn.execute(
+            "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (task_id,),
+        ).fetchall()
+        runs = conn.execute(
+            "SELECT * FROM task_runs WHERE task_id = ? ORDER BY id", (task_id,),
+        ).fetchall()
+        diags = kd.compute_task_diagnostics(row, events, runs, now=now, config=diag_config)
+        stranded = [
+            d for d in diags
+            if d.kind == "stranded_in_ready" and d.severity in ("error", "critical")
+        ]
+        if not stranded:
+            continue
+        last_alert = max(
+            (int(e["created_at"]) for e in events if e["kind"] == "dispatcher_stuck"),
+            default=None,
+        )
+        if last_alert is not None and (now - last_alert) < _STUCK_ALERT_COOLDOWN_SECONDS:
+            continue
+        diag = stranded[0]
+        with _kb.write_txn(conn):
+            _kb._append_event(conn, task_id, "dispatcher_stuck", {
+                "severity": diag.severity, "title": diag.title, "data": diag.data,
+            })
+        alerted.append(task_id)
+    return alerted
 
 
 _GUARD_TIME_COLS = {"task_runs": "ended_at", "task_events": "created_at", "task_comments": "created_at"}

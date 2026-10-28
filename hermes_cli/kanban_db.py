@@ -2078,12 +2078,13 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
                     if failures >= effective_limit:
                         continue
                     conn.execute(
-                        "UPDATE tasks SET status = ? "
+                        "UPDATE tasks SET status = ?, last_failure_error = NULL "
                         "WHERE id = ? AND status = 'blocked'", (resume_status, task_id),
                     )
                 else:
                     conn.execute(
-                        "UPDATE tasks SET status = ? WHERE id = ? AND status = 'todo'",
+                        "UPDATE tasks SET status = ?, last_failure_error = NULL "
+                        "WHERE id = ? AND status = 'todo'",
                         (resume_status, task_id),
                     )
                 _append_event(
