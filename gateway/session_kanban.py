@@ -88,7 +88,8 @@ async def run_task(connection, params):
     # task closes. Retry checks the saved claim, never reinterprets updated cards.
     request_id = 'kanban:' + json.dumps([params.get('board'), params.get('task_id'), params.get('run_id')], separators=(',', ':'))
     sid = local_identity(authority.profile_id, connection.actor.subject, request_id)
-    saved = local_receipt(authority.db, sid) if authority.db.get_session(sid) is not None else None
+    existing = await asyncio.to_thread(authority.db.get_session, sid)
+    saved = await asyncio.to_thread(local_receipt, authority.db, sid) if existing is not None else None
     if saved:
         policy = restore_policy(saved['policy'])
         context = json.loads(policy.kanban_json or '{}')
@@ -98,7 +99,7 @@ async def run_task(connection, params):
         from gateway.session_local_recovery import restore_local_session
         ref = restore_local_session(authority, sid)
     else:
-        policy, private = build_kanban_policy(connection, params, _load_gateway_config())
+        policy, private = await asyncio.to_thread(build_kanban_policy, connection, params, _load_gateway_config())
         ref = create_local_session(authority, connection.actor, {'request_id': request_id},
                                    trusted_policy=policy, trusted_secrets=private)
     from hermes_cli.kanban_db_connect import connect_closing
