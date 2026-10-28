@@ -10,6 +10,7 @@ in ``kanban_watchers_common``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import time
 from pathlib import Path
@@ -122,16 +123,22 @@ class GatewayKanbanWatchersMixin:
 
     def _kanban_sub_op(self, board: Optional[str], op: str, sub: dict, **extra: Any) -> None:
         """Sync helper (runs in to_thread): call ``kanban_db_notify.<op>`` for one subscription on its board."""
+        from hermes_cli import kanban_db as _kb
         from hermes_cli import kanban_db_connect as _kbc
         from hermes_cli import kanban_db_notify as _kbn
-        conn = _kbc.connect(board=board)
-        try:
-            getattr(_kbn, op)(
-                conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
-                thread_id=sub.get("thread_id") or "", **extra,
-            )
-        finally:
-            conn.close()
+        # Cursor writes are machine flow: the sub's board slug must resolve
+        # through the env pin on a dispatcher-pinned box (same as the notifier
+        # tick), or advance/rewind land on a per-slug DB the notifier never
+        # reads and cursors silently reset.
+        with _kb.pin_first_board_resolution():
+            conn = _kbc.connect(board=board)
+            try:
+                getattr(_kbn, op)(
+                    conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
+                    thread_id=sub.get("thread_id") or "", **extra,
+                )
+            finally:
+                conn.close()
 
     def _kanban_advance(self, sub: dict, cursor: int, board: Optional[str] = None) -> None:
         self._kanban_sub_op(board, "advance_notify_cursor", sub, new_cursor=cursor)
@@ -304,6 +311,11 @@ class GatewayKanbanWatchersMixin:
                     ready_pending = await _to_thread_process_service(dispatcher.ready_nonempty)
                     bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
                 now = int(time.time())
+                if bad_ticks >= _HEALTH_WINDOW:
+                    with contextlib.suppress(Exception):
+                        alerted = await _to_thread_process_service(dispatcher.alert_stuck_tasks)
+                        if alerted:
+                            logger.info("kanban dispatcher: emitted dispatcher_stuck alert for %s", alerted)
                 if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
                     held = _kbd.describe_suppression(res for _slug, res in (results or []))
                     logger.warning(
