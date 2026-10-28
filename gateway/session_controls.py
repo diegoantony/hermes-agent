@@ -797,7 +797,7 @@ class AuthorityConnection:
             # a finite viewer reads its ledger (tokens, cost, model, exit reason) from here, the same
             # dict the in-process one-shot wrote from `run_conversation`.
             from gateway.session_results import admission_result
-            saved = admission_result(self.authority.db, receipt.admission_id)
+            saved = await asyncio.to_thread(admission_result, self.authority.db, receipt.admission_id)
             if saved is not None:
                 out['result'] = saved['result']
                 out['usage'] = saved.get('usage') or {}
