@@ -184,6 +184,27 @@ def _single_query_exit_code(result, *, credentials_rate_limited: bool = False,
     return 1
 
 
+def _rate_limit_exit_hint(exit_code: int, *, result=None, seconds_hint=None) -> dict:
+    """``exit_single_query`` kwargs carrying the provider's reset, when ``exit_code`` is the
+    rate-limit sentinel (#b88db5f0).
+
+    ``result``'s ``failure_resets_at`` (an absolute epoch — ``agent.turn_recovery`` stamps it
+    off the classified error's ``reset_at`` hint) wins when present; ``seconds_hint`` (e.g. an
+    ``AuthError.retry_after`` caught before any turn ran) is the fallback. Neither present ->
+    ``{}``, and the dispatcher's flat cooldown / backoff applies exactly as before this.
+    """
+    from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
+    if exit_code != KANBAN_RATE_LIMIT_EXIT_CODE:
+        return {}
+    if isinstance(result, dict):
+        resets_at = result.get("failure_resets_at")
+        if isinstance(resets_at, (int, float)) and resets_at > 0:
+            return {"resets_at": float(resets_at)}
+    if isinstance(seconds_hint, (int, float)) and seconds_hint > 0:
+        return {"resets_in_seconds": float(seconds_hint)}
+    return {}
+
+
 def _run_quiet_single_query(cli, effective_query, emitter=None):
     """Quiet (-Q) one-shot turn: run, print the response (stderr for errors/session_id), then sys.exit with the automation exit code.
     With a ``StreamJsonEmitter`` the final answer and the exit line become the terminal ``result`` JSONL record instead.
@@ -293,7 +314,7 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     _exit_code = _single_query_exit_code(result)
     if emitter is not None:
         _exit_code = emitter.emit_result(result, session_id=cli.session_id or "", exit_code=_exit_code)
-    exit_single_query(_exit_code)
+    exit_single_query(_exit_code, **_rate_limit_exit_hint(_exit_code, result=result))
 
 
 def _route_single_query_images(cli, query, effective_query, single_query_images, single_query_image_urls):
@@ -509,7 +530,8 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
             if emitter is not None:
                 emitter.emit_result({"failed": True, "error": "credentials or agent init failed"},
                                     session_id=cli.session_id or "", exit_code=fail_code)
-            exit_single_query(fail_code)  # credentials or agent init failed
+            exit_single_query(fail_code, **_rate_limit_exit_hint(  # credentials or agent init failed
+                fail_code, seconds_hint=getattr(cli, "_credentials_reset_hint", None)))
         # No welcome banner (~420 ms cold); session id / resume hint come from _print_exit_summary().
         _query_label = query or ("[image attached]" if single_query_images else "")
         if _query_label:
@@ -527,9 +549,12 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
         cli._print_exit_summary(clear_screen=False)
         # Same exit contract as `-Q`: scripts and the Kanban dispatcher read the outcome from
         # the exit code. This path used to fall through to an implicit 0 for every outcome.
-        exit_single_query(_single_query_exit_code(
+        _exit_code = _single_query_exit_code(
             cli._last_turn_result,
             credentials_rate_limited=getattr(cli, "_credentials_rate_limited", False),
-            credentials_terminal=getattr(cli, "_credentials_terminal", False)))
+            credentials_terminal=getattr(cli, "_credentials_terminal", False))
+        exit_single_query(_exit_code, **_rate_limit_exit_hint(
+            _exit_code, result=cli._last_turn_result,
+            seconds_hint=getattr(cli, "_credentials_reset_hint", None)))
     finally:
         _finalize_single_query(cli)

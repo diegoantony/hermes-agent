@@ -1185,6 +1185,7 @@ def max_retries_exhausted_result(
     _billing_block = None
     _billing_unverified = False
     _free_tier_kind = ""
+    _reset_at = None
     if _is_billing:
         _billing_unverified = classified.billing_unverified
         _final_response = _billing_terminal_label(_final_summary, _billing_unverified)
@@ -1229,6 +1230,11 @@ def max_retries_exhausted_result(
         # Present only for billing walls: (provider, billing_url, is_nous, message).
         "billing_block": _billing_block,
     })
+    if _reset_at:
+        # The provider's own reset instant (absolute epoch): a Kanban worker exiting on this
+        # wall forwards it to the dispatcher's exit trailer so the task waits for the ACTUAL
+        # reset instead of respawning on a flat cooldown through a multi-hour window (#b88db5f0).
+        result["failure_resets_at"] = _reset_at
     # Retry-exhaustion after partial delivery (#119001): the text was already
     # shown, so keep it as the reply (marked failed) instead of an error-only
     # turn — the gateway flags ``partial`` and surfaces retain the bubble.
