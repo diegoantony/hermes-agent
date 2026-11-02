@@ -30,13 +30,24 @@ _MAX_QUIET_NOTIFY_ROUNDS = 8
 KANBAN_WORKER_EXIT_TRAILER = "[kanban-worker-exit] rc="
 
 
-def exit_single_query(code: int) -> None:
-    """``sys.exit(code)`` for a one-shot turn; a Kanban worker first writes the exit trailer to its log."""
+def exit_single_query(code: int, *, resets_at: "float | None" = None, resets_in_seconds: "float | None" = None) -> None:
+    """``sys.exit(code)`` for a one-shot turn; a Kanban worker first writes the exit trailer to its log.
+
+    ``resets_at`` (absolute epoch) or ``resets_in_seconds`` (seconds measured at the moment of
+    the 429) ride the SAME trailer line as a rate-limit exit code, so the dispatcher's
+    ``check_respawn_guard`` can wait for the provider's own reset instant instead of a flat
+    cooldown (#b88db5f0). Ignored for any other exit code. ``resets_at`` wins when both are given.
+    """
     if os.environ.get("HERMES_KANBAN_TASK"):
         with contextlib.suppress(Exception):
+            suffix = ""
+            if resets_at is not None:
+                suffix = f" resets_at={float(resets_at)}"
+            elif resets_in_seconds is not None:
+                suffix = f" resets_in={float(resets_in_seconds)}"
             # stderr: stdout may be the ``--stream-json`` record stream, and the worker log
             # captures both streams.
-            print(f"\n{KANBAN_WORKER_EXIT_TRAILER}{int(code)}", file=sys.stderr, flush=True)
+            print(f"\n{KANBAN_WORKER_EXIT_TRAILER}{int(code)}{suffix}", file=sys.stderr, flush=True)
     sys.exit(code)
 
 

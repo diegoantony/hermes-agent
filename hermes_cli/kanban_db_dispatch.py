@@ -79,6 +79,12 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS``.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
+# Ceiling on how long a worker-reported quota reset (``resets_at`` / ``resets_in_seconds``,
+# see ``_worker_log_rate_limit_hint``) may push the next spawn out — a provider payload lying
+# about (or miscomputing) its own reset window must not park a card forever. Overridable via
+# ``HERMES_KANBAN_RATE_LIMIT_MAX_WAIT_SECONDS``.
+DEFAULT_RATE_LIMIT_MAX_WAIT_SECONDS = 6 * 3600  # 6 hours
+
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
@@ -258,7 +264,10 @@ def _exit_code_kind(code: int) -> "tuple[str, int]":
 
 
 _EXIT_TRAILER_RE = re.compile(
-    r"^" + re.escape(KANBAN_WORKER_EXIT_TRAILER) + r"(\d+)\s*$", re.MULTILINE,
+    r"^" + re.escape(KANBAN_WORKER_EXIT_TRAILER) + r"(\d+)"
+    r"(?:\s+resets_at=(?P<resets_at>[0-9.]+)|\s+resets_in=(?P<resets_in>[0-9.]+))?"
+    r"\s*$",
+    re.MULTILINE,
 )
 
 
@@ -270,12 +279,39 @@ def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional
     or not the process running this sweep ever reaped the worker. Last trailer
     wins — the log is append-mode across re-runs.
     """
+    matches = _EXIT_TRAILER_RE.finditer(_worker_log_tail_for_trailer(task_id, board=board))
+    code = None
+    for m in matches:
+        code = int(m.group(1))
+    return code
+
+
+def _worker_log_tail_for_trailer(task_id: str, board: Optional[str] = None) -> str:
     try:
-        raw = _kb.read_worker_log(task_id, tail_bytes=4000, board=board)
+        return _kb.read_worker_log(task_id, tail_bytes=4000, board=board) or ""
     except Exception:
-        return None
-    matches = _EXIT_TRAILER_RE.findall(raw or "")
-    return int(matches[-1]) if matches else None
+        return ""
+
+
+def _worker_log_rate_limit_hint(task_id: str, board: Optional[str] = None) -> dict:
+    """Quota-reset hint from the worker's own exit trailer, when it reported one (#b88db5f0).
+
+    A 429's ``resets_at`` (absolute epoch) or ``resets_in`` (seconds, measured when the
+    worker observed the wall) rides the same trailer line as the exit code —
+    ``hermes_cli.quiet_single_query.exit_single_query``. Last trailer wins, same as the
+    exit code itself. Returns ``{}`` when the worker reported neither (an older worker
+    build, or a wall with no reset information at all — the dispatcher then falls back to
+    the flat cooldown / backoff in ``check_respawn_guard``).
+    """
+    hint: dict = {}
+    for m in _EXIT_TRAILER_RE.finditer(_worker_log_tail_for_trailer(task_id, board=board)):
+        if m.group("resets_at") is not None:
+            hint = {"resets_at": float(m.group("resets_at"))}
+        elif m.group("resets_in") is not None:
+            hint = {"resets_in_seconds": float(m.group("resets_in"))}
+        else:
+            hint = {}
+    return hint
 
 
 def reap_worker_zombies() -> "list[int]":
@@ -1097,11 +1133,17 @@ def _classify_dead_worker_exit(
     if kind == "rate_limited":
         # Quota wall — NOT a task failure. Release to the source phase and do
         # NOT count a failure so a long quota window can't trip the breaker.
+        payload = {"pid": pid, "claimer": claimer, "exit_code": code}
+        if task_id:
+            # The worker's own reset hint (#b88db5f0): persisted into the run's metadata by
+            # ``_end_run``, so ``check_respawn_guard`` can wait for the REPORTED reset instead
+            # of a flat cooldown that still respawns many times inside a multi-hour window.
+            payload.update(_worker_log_rate_limit_hint(task_id, board=board))
         return _DeadWorker(
             kind, code,
             f"pid {pid} exited rate-limited (quota wall) — requeued without counting a failure",
             "rate_limited",
-            {"pid": pid, "claimer": claimer, "exit_code": code},
+            payload,
             rate_limited=True,
         )
     if kind == "terminal_provider":
@@ -1522,6 +1564,39 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def _resolve_rate_limit_max_wait_seconds() -> int:
+    """``HERMES_KANBAN_RATE_LIMIT_MAX_WAIT_SECONDS`` (else default); the hard cap below."""
+    return _kb._env_int(
+        "HERMES_KANBAN_RATE_LIMIT_MAX_WAIT_SECONDS", DEFAULT_RATE_LIMIT_MAX_WAIT_SECONDS,
+    )
+
+
+def _rate_limit_not_before(meta: dict, ended_at, rl_cooldown: int) -> Optional[int]:
+    """Epoch after which a rate-limited task may respawn, or ``None`` to skip the guard.
+
+    Prefers the provider's own reset instant over the flat cooldown: a 429 answers with an
+    exact ``resets_at`` (absolute epoch) or ``resets_in_seconds`` (seconds, measured when the
+    worker observed the wall — see ``_worker_log_rate_limit_hint``), and a multi-hour quota
+    window respawning every ``rl_cooldown`` is exactly the bug this guard exists to close
+    (#b88db5f0: one task hit 117 respawns across a two-day window). Both are capped by
+    ``_resolve_rate_limit_max_wait_seconds`` so a bogus or unbounded provider value can't park
+    the card forever. Falls back to the flat cooldown — unchanged behavior — when the worker
+    reported no reset at all; ``None`` only when the cooldown is disabled AND no reset was
+    reported (tests set ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS=0`` to respawn at once).
+    """
+    cap = _resolve_rate_limit_max_wait_seconds()
+    ended = int(ended_at) if ended_at is not None else int(time.time())
+    resets_at = meta.get("resets_at")
+    if isinstance(resets_at, (int, float)) and resets_at > 0:
+        return min(int(resets_at), ended + cap)
+    resets_in = meta.get("resets_in_seconds")
+    if isinstance(resets_in, (int, float)) and resets_in > 0:
+        return ended + min(int(resets_in), cap)
+    if rl_cooldown <= 0:
+        return None
+    return ended + rl_cooldown
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -1530,10 +1605,11 @@ def check_respawn_guard(
     Called per ready/review row before any claim attempt. Priority order:
     ``"infrastructure_cooldown"`` (latest run is a ``spawn_failed`` the host
     refused — no restart-safe scope — within the cooldown; never counted),
-    ``"rate_limit_cooldown"`` (latest run ``rate_limited`` within the cooldown;
-    checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
-    ``last_failure_error`` that would otherwise park the task forever — that
-    path never increments ``consecutive_failures``), ``"blocker_auth"``
+    ``"rate_limit_cooldown"`` (latest run ``rate_limited`` before its
+    ``_rate_limit_not_before`` instant; checked BEFORE ``blocker_auth`` because
+    the requeue stamps a quota-flavored ``last_failure_error`` that would
+    otherwise park the task forever — that path never increments
+    ``consecutive_failures``), ``"blocker_auth"``
     (quota/auth pattern; the breaker still trips eventually), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
@@ -1570,16 +1646,15 @@ def check_respawn_guard(
             if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
                 return "infrastructure_cooldown"
     if latest_run is not None and latest_run["outcome"] == "rate_limited":
-        if rl_cooldown <= 0:
-            # Cooldown disabled — respawn immediately, skipping blocker_auth so
-            # the stamped rate-limit text doesn't re-trap the task.
-            return None
-        ended_at = latest_run["ended_at"]
-        if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
+        not_before = _rate_limit_not_before(
+            _kb._json_dict(latest_run["metadata"]), latest_run["ended_at"], rl_cooldown,
+        )
+        if not_before is not None and now < not_before:
             return "rate_limit_cooldown"
-        # Cooldown elapsed — return early so blocker_auth doesn't catch the
-        # stamped rate-limit text; this path intentionally retries forever
-        # (spaced by the cooldown) until quota returns or a real run supersedes it.
+        # No reset reported and the cooldown is disabled, or the wait elapsed — return
+        # early so blocker_auth doesn't catch the stamped rate-limit text; this path
+        # intentionally retries forever (spaced by the wait) until quota returns or a
+        # real run supersedes it.
         return None
 
     # 2. Quota / auth blocker: retrying immediately will not help.  A plain
