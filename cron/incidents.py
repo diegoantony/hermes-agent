@@ -55,6 +55,11 @@ def _db_path() -> Path:
     return get_hermes_home().resolve() / "cron" / "executions.db"
 
 
+def _init_incidents_connection(conn: sqlite3.Connection) -> None:
+    _executions.configure_ledger_connection(conn)
+    _initialize_schema(conn)
+
+
 def _connect() -> sqlite3.Connection:
     # Late imports: a scheduler daemon that outlives an on-disk upgrade already has the OLD
     # ``hermes_cli.sqlite_util`` / ``cron.jobs`` cached, so new names must be resolved at call time,
@@ -64,7 +69,12 @@ def _connect() -> sqlite3.Connection:
 
     path = _db_path()
     _ensure_cron_dir(path.parent)
-    return open_db(path, db_label="cron/executions.db", synchronous_full=True, initialize=_initialize_schema)
+    # Same database as the executions ledger: same busy tolerance and close behaviour.
+    return open_db(
+        path, db_label="cron/executions.db", synchronous_full=True,
+        busy_timeout_ms=_executions._busy_timeout_ms(),
+        initialize=_init_incidents_connection,
+    )
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:

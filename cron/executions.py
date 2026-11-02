@@ -7,6 +7,7 @@ to match the claim-time fingerprint is not proof of death. Terminal states are i
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import sqlite3
@@ -34,9 +35,63 @@ LIVE_OWNER_STALE_CLAIM_FLOOR_SECONDS = 7200.0
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
+logger = logging.getLogger(__name__)
+# Busy tolerance of every ledger connection. ``None`` = the jobs-store lock timeout
+# (``cron.jobs._JOBS_LOCK_TIMEOUT_SECONDS``, 30 s): both guard the same fire, and a WAL commit under
+# ``synchronous=FULL`` holds the write lock across an fsync that a loaded host can stall for several
+# seconds — the old 5 s ``open_db`` default turned that stall into a failed create/adopt/finish.
+BUSY_TIMEOUT_SECONDS: Optional[float] = None
+# Terminal writes of THIS process lost to a lock wait: {execution_id: (status, finished_at, error,
+# delivery_outcome, pid)}. ``recover_interrupted_executions`` never touches a row this process owns
+# (it may still be in flight), so without a retry a ``finish_execution`` that lost the lock race
+# left the attempt ``claimed``/``running`` forever (#91db9281: 3 rows stuck 3h+ after the incident).
+_deferred_terminal_writes: Dict[str, tuple] = {}
+_deferred_lock = threading.Lock()
 
 
 # --- executions ledger --------------------------------------------------------------------------
+
+def _busy_timeout_ms() -> int:
+    seconds = BUSY_TIMEOUT_SECONDS
+    if seconds is None:
+        from cron import jobs
+
+        seconds = getattr(jobs, "_JOBS_LOCK_TIMEOUT_SECONDS", 30.0)
+    return max(1, int(float(seconds) * 1000))
+
+
+def configure_ledger_connection(conn: sqlite3.Connection) -> None:
+    """Skip the checkpoint SQLite runs when the last connection to a WAL database closes.
+
+    The ledger opens one connection per transaction, so nearly every close is the last one: it
+    checkpoints, fsyncs and deletes ``-wal`` while holding the database lock, and the next
+    transaction re-creates it — dozens of create/delete cycles a minute, each a journal commit
+    on the host filesystem (53 in 90s measured with the host otherwise calm). On a host with slow
+    fsync that close held every other writer out for tens of seconds. With this flag the WAL
+    persists and is checkpointed by SQLite's own automatic checkpoint (every ~1000 pages) instead.
+    Needs Python 3.12+ (``sqlite3.Connection.setconfig``); older interpreters keep the old behaviour.
+    """
+    flag = getattr(sqlite3, "SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE", None)
+    setconfig = getattr(conn, "setconfig", None)
+    if flag is None or setconfig is None:
+        return
+    try:
+        setconfig(flag, True)
+    except sqlite3.Error as exc:  # pragma: no cover - library built without the option
+        logger.debug("cron ledger: NO_CKPT_ON_CLOSE unavailable: %s", exc)
+
+
+def _is_lock_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return isinstance(exc, sqlite3.OperationalError) and (
+        "database is locked" in message or "database is busy" in message
+    )
+
+
+def _init_ledger_connection(conn: sqlite3.Connection) -> None:
+    configure_ledger_connection(conn)
+    _initialize_schema(conn)
+
 
 def _connect() -> sqlite3.Connection:
     # Late imports: a scheduler daemon that outlives an on-disk upgrade already has the OLD
@@ -47,7 +102,11 @@ def _connect() -> sqlite3.Connection:
 
     path = EXECUTIONS_FILE or (get_hermes_home().resolve() / "cron" / "executions.db")
     _ensure_cron_dir(path.parent)
-    return open_db(path, db_label="cron/executions.db", synchronous_full=True, initialize=_initialize_schema)
+    return open_db(
+        path, db_label="cron/executions.db", synchronous_full=True,
+        busy_timeout_ms=_busy_timeout_ms(),
+        initialize=_init_ledger_connection,
+    )
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
@@ -203,6 +262,8 @@ def create_execution(
         )
         record = _fetch(conn, execution_id)
     _emit_execution_state(record)
+    # The ledger just accepted a write: a good moment to land any terminal write lost earlier.
+    _settle_deferred_best_effort()
     return record  # type: ignore[return-value]
 
 
@@ -286,26 +347,96 @@ def finish_execution(
     execution_id: str, *, success: bool, error: Optional[str] = None,
     delivery_outcome: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Write a terminal result once; terminal attempts cannot be rewritten."""
+    """Write a terminal result once; terminal attempts cannot be rewritten.
+
+    A write that loses the lock race (slow-fsync host, #91db9281) is deferred and retried by
+    ``settle_deferred_terminal_writes`` instead of leaving the attempt ``claimed``/``running``
+    forever — the caller still sees the original exception and keeps its own error path.
+    """
     now = _hermes_now().isoformat()
     status = "completed" if success else "failed"
     detail = None if success else (str(error) if error else "unknown failure")
-    with _transaction() as conn:
-        cur = conn.execute(
-            """UPDATE executions
-               SET status=?, finished_at=?, error=?, handoff_pending=0,
-                   handoff_started_at=NULL, delivery_outcome=?
-               WHERE id=? AND status IN ('claimed','running')
-                 AND process_id=? AND pid=?""",
-            (status, now, detail, delivery_outcome, execution_id, _PROCESS_ID, os.getpid()),
-        )
-        if cur.rowcount != 1:
-            return None
-        _prune_unlocked(conn)
-        record = _fetch(conn, execution_id)
+    pid = os.getpid()
+    try:
+        with _transaction() as conn:
+            record = _finish_unlocked(conn, execution_id, status, now, detail, delivery_outcome, pid)
+    except sqlite3.OperationalError as exc:
+        if _is_lock_error(exc):
+            with _deferred_lock:
+                _deferred_terminal_writes[str(execution_id)] = (
+                    status, now, detail, delivery_outcome, pid)
+            logger.warning(
+                "cron ledger: terminal write for execution %s deferred (%s); retried while "
+                "this process lives", execution_id, exc)
+        raise
+    with _deferred_lock:
+        _deferred_terminal_writes.pop(str(execution_id), None)
+    if record is None:
+        return None
     _emit_execution_state(record, delivery_outcome=delivery_outcome)
     record_cron_finish(record, delivery_outcome)
     return record
+
+
+def _finish_unlocked(conn, execution_id, status, now, detail, delivery_outcome, pid):
+    cur = conn.execute(
+        """UPDATE executions
+           SET status=?, finished_at=?, error=?, handoff_pending=0,
+               handoff_started_at=NULL, delivery_outcome=?
+           WHERE id=? AND status IN ('claimed','running')
+             AND process_id=? AND pid=?""",
+        (status, now, detail, delivery_outcome, execution_id, _PROCESS_ID, pid),
+    )
+    if cur.rowcount != 1:
+        return None
+    _prune_unlocked(conn)
+    return _fetch(conn, execution_id)
+
+
+def settle_deferred_terminal_writes() -> int:
+    """Retry terminal writes ``finish_execution`` lost to a locked ledger; returns rows settled.
+
+    Owner-fenced exactly like the original write and keeps the original ``finished_at``. A row
+    no longer this process's live attempt is dropped (someone else already settled it). Stops at
+    the first lock error, leaving the rest for the next call (``create_execution`` and
+    ``recover_interrupted_executions`` both call this opportunistically).
+    """
+    with _deferred_lock:
+        pending = list(_deferred_terminal_writes.items())
+    settled = 0
+    for execution_id, (status, now, detail, delivery_outcome, pid) in pending:
+        if pid != os.getpid():  # inherited across a fork: not ours to write
+            with _deferred_lock:
+                _deferred_terminal_writes.pop(execution_id, None)
+            continue
+        try:
+            with _transaction() as conn:
+                record = _finish_unlocked(
+                    conn, execution_id, status, now, detail, delivery_outcome, pid)
+        except sqlite3.Error as exc:
+            logger.warning("cron ledger: deferred terminal write for %s still failing: %s",
+                            execution_id, exc)
+            break
+        with _deferred_lock:
+            if _deferred_terminal_writes.get(execution_id) == (
+                    status, now, detail, delivery_outcome, pid):
+                _deferred_terminal_writes.pop(execution_id, None)
+        if record is not None:
+            settled += 1
+            logger.info("cron ledger: deferred terminal write for %s settled as %s",
+                        execution_id, status)
+            _emit_execution_state(record, delivery_outcome=delivery_outcome)
+            record_cron_finish(record, delivery_outcome)
+    return settled
+
+
+def _settle_deferred_best_effort() -> None:
+    if not _deferred_terminal_writes:
+        return
+    try:
+        settle_deferred_terminal_writes()
+    except Exception as exc:  # never let the retry break the caller's own write
+        logger.debug("cron ledger: deferred terminal settle failed: %s", exc)
 
 
 _OWNER_GONE_REASON = (
@@ -330,6 +461,9 @@ def recover_interrupted_executions() -> int:
     # tick must stay config-free (tests/cron/test_idle_tick_config_skip.py).
     stale_after: Optional[float] = None
     stale_after_resolved = False
+    # This process's own rows are skipped below (still in flight here): a terminal write it lost
+    # to a locked ledger is landed now instead of waiting for this process to restart (#91db9281).
+    _settle_deferred_best_effort()
     with _transaction() as conn:
         rows = conn.execute(
             """SELECT id, status, process_id, pid, process_started_at,
