@@ -2211,6 +2211,34 @@ def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_s
         logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
 
 
+def _finalize_gated_cron_session(cron_session_id: str, job: dict, job_id: str, job_name: str) -> None:
+    """Close an authority-owned cron session (``local-*``) that an early pre-agent gate suppressed.
+
+    ``gateway/session_cron.py``'s unified runtime admits and creates this session row at FIRE time,
+    before ``run_job`` is ever called. When ``_prepare_job_prompt`` short-circuits (monitor output
+    unchanged, ``wakeAgent: false``, an empty/blocked prompt), ``run_job`` returns before reaching the
+    try/finally that normally finalizes the session via ``_finalize_cron_session`` — left alone, the
+    row never gets an ``end_reason`` and accumulates as an open, empty (0 messages, 0 api calls)
+    session until the next gateway restart's ``startup_orphan_reap`` sweep closes a backlog of them in
+    bulk. Finalizing here, one gated tick at a time, keeps the row count flat and gives each tick its
+    own honest ``end_reason`` (``cron_incomplete_no_output``, since a gated run produces no assistant
+    message) instead of relying on a restart to clean up after it. Best-effort: a failure here must
+    never surface as the fire's own failure, so every exception is swallowed and logged.
+    """
+    try:
+        _gated_session_db = _open_cron_session_db(job)
+    except (Exception, KeyboardInterrupt) as e:
+        logger.debug("Job '%s': failed to open session store to close gated session: %s", job_id, e)
+        return
+    if _gated_session_db is None:
+        return
+    try:
+        _finalize_cron_session(_gated_session_db, None, job_id, job_name, cron_session_id,
+                               workdir=_resolve_job_workdir(job, job_id))
+    except (Exception, KeyboardInterrupt) as e:
+        logger.debug("Job '%s': failed to finalize gated cron session: %s", job_id, e)
+
+
 def _normalize_newlines(text: str) -> str:
     """CRLF/CR -> LF, matching what text-mode reads of the archive return."""
     return text.replace("\r\n", "\n").replace("\r", "\n")
@@ -2571,6 +2599,16 @@ def run_job(
 
     early, prompt = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
     if early is not None:
+        # A unified-runtime fire already admitted an authority-owned session (``local-*``) for this
+        # tick BEFORE run_job was ever called (gateway/session_cron.py:_create, at submit time). An
+        # early gate here (monitor unchanged, wake-gate false, empty/blocked prompt) short-circuits
+        # before the try/finally below that normally finalizes it via _finalize_cron_session — left
+        # alone, that session row never gets an end_reason and sits open until the next gateway
+        # restart's startup_orphan_reap sweep closes it in bulk (0 messages, 0 api calls). Finalize
+        # it here exactly like a normal completed run so monitor/no_agent-gated ticks never leak an
+        # open session row.
+        if owner_execution is not None:
+            _finalize_gated_cron_session(owner_execution[1], job, job_id, job_name)
         return early
     from run_agent import AIAgent
 
@@ -2667,6 +2705,12 @@ def run_job(
         if _session_db and not _worker_teardown_deferred:
             _finalize_cron_session(_session_db, agent, job_id, job_name, _cron_session_id,
                                    workdir=scope.workdir)
+        elif owner_execution is not None and not _worker_teardown_deferred:
+            # setup.blocked (or another early return before _open_cron_session_db) hit this
+            # finally with no _session_db handle at all — the same authority-owned session leak
+            # as the _prepare_job_prompt gates above, just a narrower trigger (model/provider
+            # resolution failure). Close it the same way, via its own fresh handle.
+            _finalize_gated_cron_session(_cron_session_id, job, job_id, job_name)
         # Tear down the ephemeral agent or the gateway leaks fds per tick (EMFILE). With deferred
         # teardown, hand the live agent back: delivery needs a live async client.
         # Release subprocesses, terminal sandboxes, browser daemons, and the main OpenAI/httpx client held
