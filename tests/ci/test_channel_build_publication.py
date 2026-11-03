@@ -24,7 +24,7 @@ from tests.ci.desktop_release_roles import (
     universal_assembler,
 )
 from tests.ci.test_desktop_release_tag_admission import _seed_repo, _git, _workflow
-from tests.scripts.test_release_r2 import r2_server  # noqa: F401
+from tests.scripts.test_release_r2 import r2_server
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -33,7 +33,7 @@ def request_for(base):
     return {"schema": 1, "buildId": "a" * 32, "channel": "unknown-at-build-time", "sequence": 7,
             "repository": "fixture/repo", "commit": "b" * 40, "sourceVersion": "1.2.3",
             "version": "0.0.7", "windowsVersion": "0.0.7.0", "identity": preview_identity("unknown-at-build-time", "c" * 16),
-            "bundleEnv": {"HERMES_GUEST_ONBOARDING": "different from the prior request"}, "publicBase": base}
+            "bundleEnv": {"HERMES_DATA_DIR_SUFFIX": "different from the prior request"}, "publicBase": base}
 
 
 @pytest.fixture
@@ -58,6 +58,8 @@ def staged_channel(tmp_path, r2_server, request, monkeypatch):
     name = request["identity"]["artifactNamePascal"]
     for platform in ("darwin", "win32"):
         for arch in ("arm64", "x64"):
+            if (platform, arch) == ("darwin", "x64"):
+                continue  # no Intel macOS leg
             native = "macos" if platform == "darwin" else "windows"
             metadata = {"platform": native, "arch": arch, "commit": request["commit"], "request": request,
                         "identity": request["identity"]["appId" if platform == "darwin" else "msixAppIdWithOrg"],
@@ -105,7 +107,7 @@ def test_channel_handoff_binds_full_request_and_feed_bytes(tmp_path, r2_server, 
     needs = {name: {"result": "success"} for name in channel_publish.REQUIRED_JOBS}
     manifest, feeds = channel_publish.assemble(request, fetched, needs=needs)
     assert {(p["platform"], p["arch"]) for p in manifest["packages"]} == {
-        (platform, arch) for platform in ("darwin", "win32") for arch in ("arm64", "x64")}
+        ("darwin", "arm64"), ("win32", "arm64"), ("win32", "x64")}
     xml = ET.parse(next(p for p in feeds if p.suffix == ".appinstaller")).getroot()
     assert xml.find("{*}UpdateSettings") is None
     assert xml.find("{*}MainBundle").get("Name") == request["identity"]["msixAppIdWithOrg"]
@@ -115,7 +117,7 @@ def test_channel_handoff_binds_full_request_and_feed_bytes(tmp_path, r2_server, 
         filename = file["url"].rsplit("/", 1)[-1]
         assert file["size"] == (build / filename).stat().st_size
     changed = copy.deepcopy(request)
-    changed["bundleEnv"]["HERMES_GUEST_ONBOARDING"] = "other packaging input"
+    changed["bundleEnv"]["HERMES_DATA_DIR_SUFFIX"] = "other packaging input"
     with pytest.raises(ValueError, match="identity"):
         handoff.fetch_channel_build(changed, ["win32-x64"], tmp_path / "wrong", public_base=request["publicBase"])
     assert not (tmp_path / "wrong").exists()
@@ -199,7 +201,7 @@ def run_shell(tmp_path, r2_server, script, env, *, cwd=None):
     gh.chmod(0o755)
     return subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script], cwd=cwd or tmp_path,
                           env={**os.environ, **env, "PATH": str(tools) + os.pathsep + os.environ["PATH"]},
-                          capture_output=True, text=True, encoding="utf-8", timeout=60)
+                          capture_output=True, text=True, encoding="utf-8", timeout=60, check=False)
 
 
 @pytest.mark.platforms("posix")
@@ -287,7 +289,7 @@ def test_real_publication_cas_and_manifest_summary(tmp_path, r2_server, staged_c
         env["GITHUB_ACTIONS"] = "true"
         # A production sentinel makes accidental writes outside scope observable.
         r2_server.store["releases/channels/stable.json"] = (b"production sentinel", '"production"')
-    artifact_key = prefix + request["identity"]["artifactNamePascal"] + "-0.0.7-mac-x64.zip"
+    artifact_key = prefix + request["identity"]["artifactNamePascal"] + "-0.0.7-mac-arm64.zip"
     saved = r2_server.store[artifact_key]
     r2_server.store[artifact_key] = (b"damaged artifact", '"damaged"')
     result = run_shell(tmp_path, r2_server, script, env, cwd=tmp_path / "clone")
@@ -401,7 +403,7 @@ def test_disposable_controller_allocates_then_separate_admission(tmp_path):
     from tests.scripts.test_release_channels import object_server
     _origin, clone = _seed_repo(tmp_path)
     commit = _git("rev-parse", "HEAD", cwd=clone)
-    with object_server() as (url, objects, headers, requests, faults):
+    with object_server() as (url, objects, _headers, requests, _faults):
         # run_shell redirects only the R2 network endpoint; the controller,
         # permission CLI, pushed Git source and both workflow scripts run for real.
         from types import SimpleNamespace
@@ -457,7 +459,7 @@ def test_receiver_allocation_uses_official_identity_only_inside_scope(tmp_path):
     from scripts.releases.channel_releases import product_identity
     from scripts.releases.r2_scope import R2Scope
 
-    with object_server() as (url, objects, *_):
+    with object_server() as (url, _objects, *_):
         pub = publisher(url)
         with pytest.raises(ValueError, match="disposable"):
             allocate_receivers(pub, "a" * 40, "1.2.3", "a" * 40)
