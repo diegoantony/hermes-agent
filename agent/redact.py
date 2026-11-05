@@ -1142,6 +1142,48 @@ def is_env_dump_command(command: str | None) -> bool:
     return False
 
 
+# `source`/`.` loads a script INTO the current shell rather than running it as a child process -
+# the standard way to apply decrypted secrets (`source <(sops -d secrets.enc.env)`, `. <(vault kv get
+# -format=json ... | jq -r '...')`). If the sourced script errors, traces (`set -x`), or itself prints
+# while being decrypted, the literal `KEY=value` lines it was about to export land verbatim in
+# stdout/stderr. Those lines carry no vendor-prefix shape (no `sk-...`, no `AKIA...`) the opaque-token
+# scan can key on, so without this check `code_file=True` (the terminal-output default) skips the
+# ENV-assignment pass that would mask them - exactly the FinanceAI credential leak in the 2026-11-04
+# incident (POSTGRES_PASSWORD, MINIO_SECRET_KEY, FERNET_SECRET_KEY, ... printed to the tool result that
+# feeds the model's context). Treated unconditionally as an env dump: a false positive just runs the
+# (harmless) ENV pass on ordinary sourced output; a false negative lets live credentials from a secrets
+# manager cross into tool output unmasked. See incident t_6763ae07 / this fix: t_aea6c442.
+_SOURCE_COMMANDS = frozenset({"source", "."})
+# Secret-decryption / secret-retrieval tools whose stdout IS the sensitive material, wherever they
+# appear in the command line - including inside `<(...)`/`$(...)` substitutions the naive
+# first-token scan in `is_env_dump_command` never looks past.
+_SECRET_DECRYPT_TOKEN_RE = re.compile(
+    r"\bsops\s+(?:-d\b|--decrypt\b)"
+    r"|\bgpg\s+(?:-d\b|--decrypt\b)"
+    r"|\bage\s+(?:-d\b|--decrypt\b)"
+    r"|\bvault\s+(?:kv\s+get|read)\b"
+    r"|\baws\s+secretsmanager\s+get-secret-value\b"
+    r"|\baws\s+kms\s+decrypt\b",
+    re.IGNORECASE,
+)
+
+
+def _sources_decrypted_secrets(command: str | None) -> bool:
+    """True if *command* sources a dynamically-produced script (`source <(...)`, `. <(...)`)
+    or invokes a known secret-decryption tool anywhere on the line (including inside a
+    substitution). Either shape means stdout/stderr can legitimately contain decrypted
+    `KEY=value` secrets with no recognizable vendor prefix."""
+    if not command or not isinstance(command, str):
+        return False
+    if _SECRET_DECRYPT_TOKEN_RE.search(command):
+        return True
+    for seg in _command_segments(command):
+        tokens = seg.split()  # not shlex: `<(...)` must survive as one token
+        if tokens and tokens[0] in _SOURCE_COMMANDS and "<(" in seg:
+            return True
+    return False
+
+
 REDACTION_UNAVAILABLE = "[redaction-unavailable]"
 # The opaque branch needs a 20-char floor (the floor the gateway/A2A sweeps always had): without it the
 # English word "bearer" turns "the bearer of bad news" into "Bearer [redacted] bad news" on every chat
@@ -1166,12 +1208,17 @@ def redact_for_egress(text: str) -> str:
 
 def redact_terminal_output(output: str, command: str | None = None, *, force: bool = False) -> str:
     """Single redaction policy for ALL terminal-output surfaces: the ENV/YAML-assignment
-    pass runs only when ``command`` is an env dump or reads a secret-bearing file (``.env``,
-    shell rc, Hermes ``config.yaml``); otherwise code_file=True avoids false positives on
-    source/config dumps."""
+    pass runs only when ``command`` is an env dump, reads a secret-bearing file (``.env``,
+    shell rc, Hermes ``config.yaml``), or sources/decrypts secrets (``source <(sops -d ...)``,
+    ``vault kv get``, ...); otherwise code_file=True avoids false positives on source/config
+    dumps."""
     if not output:
         return output
-    code_file = not (is_env_dump_command(command) or _command_reads_secret_file(command))
+    code_file = not (
+        is_env_dump_command(command)
+        or _command_reads_secret_file(command)
+        or _sources_decrypted_secrets(command)
+    )
     redacted = redact_sensitive_text(output, force=force, code_file=code_file)
     # Source-preserving output still gets the Python-repr pass on high-confidence
     # diagnostic lines (pytest ``E   `` introspection, final exception lines): that is

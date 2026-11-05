@@ -1321,6 +1321,77 @@ class TestTerminalOutputRedaction:
         assert redact_terminal_output(out, "uv run pytest") == out
 
 
+class TestSourcedDecryptedSecretsRedaction:
+    """``source <(sops -d ...)`` must mask decrypted KEY=value lines — incident t_6763ae07
+    (2026-11-04 ~23:48): a `source <(sops -d ...)` approved by the terminal guard let the
+    FinanceAI secrets it decrypted (POSTGRES_PASSWORD, MINIO_SECRET_KEY, FERNET_SECRET_KEY,
+    RLS_WEB_DB_PASSWORD, SECRET_KEY, RABBITMQ_DEFAULT_PASS, SENTRY_DSN, OPENAI_API_KEY) reach
+    the tool result unmasked, because ``source`` is not in ``_ENV_DUMP_COMMANDS`` and
+    ``sops -d`` is not a ``_FILE_READ_COMMANDS`` reader — so ``code_file`` stayed True and
+    the ENV-assignment masking pass never ran. Fixed by t_aea6c442 via
+    ``_sources_decrypted_secrets``."""
+
+    _FAKE_LEAK = (
+        "POSTGRES_PASSWORD=fakeFinanceAIPgPass123456\n"
+        "MINIO_SECRET_KEY=fakeFinanceAIMinioSecret789\n"
+        "FERNET_SECRET_KEY=fakeFinanceAIFernetKey000111\n"
+        "RLS_WEB_DB_PASSWORD=fakeFinanceAIRlsPass222333\n"
+        "SECRET_KEY=fakeFinanceAIAppSecret444555\n"
+        "RABBITMQ_DEFAULT_PASS=fakeFinanceAIRabbitPass666\n"
+        "SENTRY_DSN=https://fakepublickey@o000.ingest.sentry.io/1\n"
+    )
+
+    def test_sources_decrypted_secrets_detection(self):
+        from agent.redact import _sources_decrypted_secrets
+
+        assert _sources_decrypted_secrets("source <(sops -d secrets.enc.env)")
+        assert _sources_decrypted_secrets(". <(sops --decrypt secrets.enc.env)")
+        assert _sources_decrypted_secrets("source <(vault kv get -format=json secret/financeai)")
+        assert _sources_decrypted_secrets("sops -d secrets.enc.env > /tmp/x")
+        assert _sources_decrypted_secrets("gpg -d secret.gpg | tee /tmp/x")
+        assert not _sources_decrypted_secrets("source ./activate")
+        assert not _sources_decrypted_secrets("python app.py")
+        assert not _sources_decrypted_secrets("")
+        assert not _sources_decrypted_secrets(None)
+
+    def test_source_process_substitution_sops_decrypt_masks_leaked_env(self):
+        """Reproduces the incident: approving `source <(sops -d ...)` must not let the
+        decrypted KEY=value lines (here fake stand-ins for the real FinanceAI secrets)
+        survive in the string handed back to the tool/model."""
+        from agent.redact import redact_terminal_output
+
+        command = "source <(sops -d financeai-secrets.enc.env)"
+        red = redact_terminal_output(self._FAKE_LEAK, command)
+
+        assert "fakeFinanceAIPgPass123456" not in red
+        assert "fakeFinanceAIMinioSecret789" not in red
+        assert "fakeFinanceAIFernetKey000111" not in red
+        assert "fakeFinanceAIRlsPass222333" not in red
+        assert "fakeFinanceAIAppSecret444555" not in red
+        assert "fakeFinanceAIRabbitPass666" not in red
+        # Keys survive (only values are masked) so the model can still see WHAT leaked.
+        assert "POSTGRES_PASSWORD" in red
+        assert "SENTRY_DSN" in red
+
+    def test_dot_command_process_substitution_masks_leaked_env(self):
+        """`.` is a POSIX synonym for `source` and must get the same treatment."""
+        from agent.redact import redact_terminal_output
+
+        command = ". <(sops -d financeai-secrets.enc.env)"
+        red = redact_terminal_output(self._FAKE_LEAK, command)
+        assert "fakeFinanceAIPgPass123456" not in red
+
+    def test_plain_source_without_substitution_stays_code_file(self):
+        """`source ./activate` (no decryption, no process substitution) is ordinary shell
+        state and must NOT be forced onto the ENV pass — it would mangle legitimate
+        source/config dumps the same way `cat app.py` must not be touched."""
+        from agent.redact import redact_terminal_output
+
+        out = "VIRTUAL_ENV=/home/user/project/.venv"
+        red = redact_terminal_output(out, "source ./activate")
+        assert "/home/user/project/.venv" in red
+
+
 class TestFileReadNonReusableRedaction:
     """#35519: prefix-matched credentials in FILE CONTENT (read_file /
     search_files / cat) must be redacted to a NON-REUSABLE sentinel — not a
