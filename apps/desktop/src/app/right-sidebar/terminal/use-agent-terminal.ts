@@ -4,7 +4,7 @@ import { WebglAddon } from '@xterm/addon-webgl'
 import { Terminal } from '@xterm/xterm'
 import { useEffect, useRef } from 'react'
 
-import { writeClipboardText } from '@/components/ui/copy-button'
+import { writeClipboardText } from '@/lib/clipboard'
 import { triggerHaptic } from '@/lib/haptics'
 import { useTheme } from '@/themes/context'
 
@@ -101,7 +101,10 @@ export function useAgentTerminal({ active, id, procId }: { active: boolean; id: 
       getSelection: () => term.getSelection(),
       paste: null,
       reload: () => {},
-      selectAll: () => term.selectAll()
+      selectAll: () => term.selectAll(),
+      // No PTY input, and the mirror's tab stays deliberately closeable, so
+      // the close-tab chord keeps its close meaning here.
+      wordErase: null
     })
 
     term.attachCustomKeyEventHandler(event => {
