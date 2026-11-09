@@ -38,6 +38,25 @@ def record_unknown_worker_outcome(
                 False,
                 error,
                 delivery_error=delivery_error,
+                # t_866c5d34: this is a RECOVERED UNKNOWN outcome, not a confirmed failure —
+                # the worker was handed the fire and the owner lost track of it afterwards
+                # (connect_gateway/ensure_gateway_runtime flaking under load, a dropped
+                # websocket mid-poll, etc.); whether side effects (the agent's reply, its
+                # delivery) ran is explicitly NOT known (see external_worker_exited_reason's
+                # docstring above). A real case: job 'b3c2e80317eb' (FPF D60 weekly check-in,
+                # 2026-11-09) was stamped last_status="error" here from a transient
+                # GatewayUnavailableError, yet cron.scheduler's own log shows the SAME
+                # execution delivered its reply to Telegram two seconds later — last_status
+                # ="error" was simply false. Writing the dedicated "unknown" status (instead
+                # of letting mark_job_run derive "error" from success=False) keeps every
+                # other effect of this call identical (last_error, failure_streak,
+                # last_failure, retry-ladder bookkeeping all still key off `success=False`)
+                # while no longer asserting a failure nobody actually confirmed. Consumers
+                # that alarm strictly on last_status == "error" (e.g. the platform
+                # self-audit) stop opening false "cron em erro" cards for this class of
+                # outcome; `hermes cron list` and `last_error` still surface it for anyone
+                # who wants to look.
+                status="unknown",
                 expected_fire_owner=owner,
                 # A ladder re-run's occurrence already counted toward repeat.
                 **({"ladder_rung": True} if is_retry_run(job) else {}),

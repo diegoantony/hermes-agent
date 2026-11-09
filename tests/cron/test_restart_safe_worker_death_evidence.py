@@ -122,6 +122,15 @@ else:
         assert result["claim_released"], result
         assert "worker-probe-startup-sentinel" in (result["job_error"] or ""), result
         assert len(delivered) == 1, result
+        # t_866c5d34: a recovered-unknown outcome must never read as a confirmed failure.
+        # Real incident (2026-11-09, job 'b3c2e80317eb'): last_status="error" was stamped
+        # here from a transient GatewayUnavailableError while the SAME execution delivered
+        # its reply seconds later — last_status must say "unknown", not "error", so a
+        # strict `last_status == "error"` consumer (the platform self-audit) does not open
+        # a false incident card for a run that may well have succeeded. last_error must
+        # still carry the evidence for anyone who looks.
+        assert record["last_status"] == "unknown", record
+        assert record["last_status"] != "error", record
         assert len(executions.list_executions()) <= executions.MAX_TERMINAL_EXECUTIONS
         from cron.scheduler_worker_failure import record_unknown_worker_outcome
 

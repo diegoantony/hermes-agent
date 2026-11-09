@@ -218,6 +218,12 @@ def _last_run_display(job: dict[str, Any]) -> str:
         # Agent succeeded but the result never reached the user — not green; last_error is None.
         return color(f"ran, but the result was not delivered ({_short_reason(job.get('last_delivery_error'))}). "
                      f"{_delivery_fix_hint(job)}", Colors.YELLOW)
+    if last_status == "unknown":
+        # The owner lost track of a worker it had already handed the fire to (recovered by
+        # record_unknown_worker_outcome): whether side effects ran is genuinely unverified, not
+        # a confirmed failure — not red. last_error still carries the owner's best evidence.
+        return color(f"unverified ({_short_reason(job.get('last_error'))}); it may have completed",
+                     Colors.YELLOW)
     display = color(f"{last_status}: {job.get('last_error', '?')}", Colors.RED)
     streak = int(job.get("failure_streak") or 0)
     if streak >= 2:
