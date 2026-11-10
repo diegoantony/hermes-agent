@@ -1,5 +1,5 @@
 import path from 'path';
-import { mkdirSync, writeFileSync } from 'fs';
+import { mkdirSync, writeFileSync, appendFileSync, readFileSync, existsSync } from 'fs';
 import { randomBytes } from 'crypto';
 import { format } from 'util';
 
@@ -753,4 +753,112 @@ export function installConsoleStamps(target = console) {
 /** Machine-read JSON event lines bypass the console stamp so line parsers see bare JSON. */
 export function writeJsonLine(payload, stream = process.stdout) {
   stream.write(`${JSON.stringify(payload)}\n`);
+}
+
+/**
+ * Append-only on-disk backing store for the bridge's in-memory messageQueue.
+ *
+ * Root cause (t_b9ee59e4 follow-up, t_df8f51db): messageQueue lived only in
+ * process memory. systemd's KillMode=control-group restarts the gateway's
+ * whole cgroup together, so a crash of the unrelated Python event loop also
+ * kills this orphaned node process — any event still queued at that moment
+ * was lost silently, with zero trace in any log (distinct from the overflow
+ * drop above, which at least logs).
+ *
+ * Design: every event pushed onto messageQueue is also appended as one JSON
+ * line here (durable the instant it's queued). GET /messages truncates the
+ * file only after the HTTP response has actually been flushed to the client
+ * socket ('finish'), not merely handed to res.json() — so a crash between
+ * splice() and the client receiving bytes keeps the file intact and the
+ * event recoverable on restart (at-least-once: a possible duplicate delivery
+ * is preferred over silent loss). On boot, loadPending() replays whatever
+ * is still on disk back into messageQueue before the socket reconnects.
+ *
+ * Corrupt/partial lines (a write truncated mid-append by a hard kill) are
+ * skipped rather than thrown — recovery must never crash the bridge.
+ */
+export function createPersistentQueueStore(filePath, {
+  appendFileSyncFn = appendFileSync,
+  writeFileSyncFn = writeFileSync,
+  readFileSyncFn = readFileSync,
+  existsSyncFn = existsSync,
+  mkdirSyncFn = mkdirSync,
+  log = console.warn,
+  maxRecoveredEvents = 1000,
+} = {}) {
+  function ensureDir() {
+    const dir = path.dirname(filePath);
+    if (dir && dir !== '.') mkdirSyncFn(dir, { recursive: true });
+  }
+
+  function append(event) {
+    try {
+      ensureDir();
+      appendFileSyncFn(filePath, `${JSON.stringify(event)}\n`);
+    } catch (err) {
+      log(`[bridge] failed to persist queued event to ${filePath}: ${err?.message || err}`);
+    }
+  }
+
+  function truncate() {
+    try {
+      ensureDir();
+      writeFileSyncFn(filePath, '');
+    } catch (err) {
+      log(`[bridge] failed to truncate ${filePath}: ${err?.message || err}`);
+    }
+  }
+
+  function loadPending() {
+    if (!existsSyncFn(filePath)) return [];
+    let raw;
+    try {
+      raw = readFileSyncFn(filePath, 'utf8');
+    } catch (err) {
+      log(`[bridge] failed to read ${filePath}: ${err?.message || err}`);
+      return [];
+    }
+    const events = [];
+    let skipped = 0;
+    for (const line of raw.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        events.push(JSON.parse(trimmed));
+      } catch {
+        skipped += 1;
+      }
+    }
+    if (skipped > 0) {
+      log(`[bridge] skipped ${skipped} corrupt pending-queue line(s) in ${filePath}`);
+    }
+    if (events.length > maxRecoveredEvents) {
+      log(`[bridge] ${filePath} had ${events.length} pending events; keeping only the newest ${maxRecoveredEvents}`);
+      return events.slice(events.length - maxRecoveredEvents);
+    }
+    return events;
+  }
+
+  return { append, truncate, loadPending };
+}
+
+/**
+ * Boot-time recovery: replay a persistent queue store's pending events and
+ * compact the backing file in the same pass.
+ *
+ * Compaction matters, not just replay: if the previous process died mid
+ * fs.appendFileSync() (power loss, OOM-kill, SIGKILL), the file can end in a
+ * partial line with no trailing newline. loadPending() already discards that
+ * dangling partial line safely — but without compaction, the very next
+ * append() in the new process would concatenate directly onto those
+ * leftover bytes with no separating newline, corrupting it together with a
+ * legitimate new event. Truncating then re-appending exactly the recovered
+ * events (never the corrupt remainder) guarantees the file always starts
+ * the new process life byte-clean.
+ */
+export function recoverPendingQueue(store) {
+  const recovered = store.loadPending();
+  store.truncate();
+  for (const event of recovered) store.append(event);
+  return recovered;
 }

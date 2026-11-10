@@ -52,6 +52,8 @@ import {
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
   writeJsonLine,
+  createPersistentQueueStore,
+  recoverPendingQueue,
 } from './bridge_helpers.js';
 
 // First statement: helpers capture console.log as a default at call time below.
@@ -257,6 +259,31 @@ const logger = pino({ level: 'warn' });
 const messageQueue = [];
 const MAX_QUEUE_SIZE = 100;
 
+// Disk-backed durability for messageQueue (t_df8f51db, follow-up to
+// t_b9ee59e4): a clean process death with items still queued used to lose
+// them with zero trace, even without hitting the overflow path above.
+// See createPersistentQueueStore's doc comment in bridge_helpers.js.
+const PENDING_QUEUE_PATH = path.join(SESSION_DIR, 'pending_queue.jsonl');
+const persistentQueue = createPersistentQueueStore(PENDING_QUEUE_PATH);
+
+function enqueueEvent(event) {
+  persistentQueue.append(event);
+  messageQueue.push(event);
+}
+
+// Recover anything still on disk from a previous process's unflushed queue
+// before the socket reconnects, so a restart (clean or crashed) with pending
+// items doesn't start the queue silently empty.
+try {
+  const recovered = recoverPendingQueue(persistentQueue);
+  if (recovered.length > 0) {
+    messageQueue.push(...recovered);
+    console.log(`♻️  Recovered ${recovered.length} pending message(s) from ${PENDING_QUEUE_PATH} after restart`);
+  }
+} catch (err) {
+  console.warn('[bridge] failed to recover pending message queue:', err?.message || err);
+}
+
 // Track recently sent message IDs.  Two purposes:
 //   1. Prevent echo-back loops with media in self-chat mode.
 //   2. (When WHATSAPP_FORWARD_OWNER_MESSAGES=true) distinguish our own
@@ -365,9 +392,11 @@ function enqueuePollUpdateEvent({ key, update, selectedOptions, aggregation }) {
     botIds: [],
     timestamp: Math.floor(Date.now() / 1000),
   };
-  messageQueue.push(event);
+  enqueueEvent(event);
   if (messageQueue.length > MAX_QUEUE_SIZE) {
-    messageQueue.shift();
+    const dropped = messageQueue.shift();
+    logger.warn({ dropped: { chatId: dropped?.chatId, senderId: dropped?.senderId, timestamp: dropped?.timestamp, nativeType: dropped?.nativeType } },
+      'messageQueue overflow: dropping oldest queued event (Python gateway not polling /messages fast enough)');
   }
 }
 
@@ -778,7 +807,7 @@ async function startSocket() {
         mediaType: event.mediaType,
         mediaUrls: event.mediaUrls,
       });
-      messageQueue.push(event);
+      enqueueEvent(event);
       emitDebugEvent({
         stage: 'queued',
         chatId: redactWhatsAppId(chatId),
@@ -790,7 +819,9 @@ async function startSocket() {
         queueLength: messageQueue.length,
       });
       if (messageQueue.length > MAX_QUEUE_SIZE) {
-        messageQueue.shift();
+        const dropped = messageQueue.shift();
+        logger.warn({ dropped: { chatId: dropped?.chatId, senderId: dropped?.senderId, timestamp: dropped?.timestamp, body: (dropped?.body || '').slice(0, 80) } },
+          'messageQueue overflow: dropping oldest queued event (Python gateway not polling /messages fast enough)');
       }
     }
   });
@@ -835,6 +866,13 @@ app.use((req, res, next) => {
 app.get('/messages', (req, res) => {
   const msgs = messageQueue.splice(0, messageQueue.length);
   res.json(msgs);
+  if (msgs.length > 0) {
+    // Truncate the pending-queue file only once the response has actually
+    // been flushed to the client socket (not merely handed to res.json()),
+    // so a crash in between keeps these events on disk and recoverable —
+    // see createPersistentQueueStore's doc comment in bridge_helpers.js.
+    res.on('finish', () => persistentQueue.truncate());
+  }
 });
 
 // Send a message
