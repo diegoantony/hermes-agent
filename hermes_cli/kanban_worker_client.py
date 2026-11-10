@@ -112,6 +112,16 @@ def _submit():
         return asyncio.run(run(params, board_db))
     except (KeyError, ValueError, OSError) as exc:
         print(f'Kanban owner refused: {exc}', file=sys.stderr)
+        # A GatewayUnavailableError that ``run`` re-raised because OWNER_WAIT_S ran out while the
+        # owner was still ``starting``/``draining`` (never a real crash — a cold-booting or
+        # momentarily wedged owner is a host condition): give the dispatcher a dedicated exit code
+        # so it requeues without spending the card's failure budget, same contract as a rate-limit
+        # quota wall. Any OTHER GatewayUnavailableError state (``incompatible``, ``inaccessible``,
+        # ``profile_parked``, ...) is a real refusal and keeps the plain exit 1.
+        from hermes_cli.gateway_client import GatewayUnavailableError
+        if isinstance(exc, GatewayUnavailableError) and exc.state in _TRANSIENT_OWNER_STATES:
+            from hermes_cli.kanban_db import KANBAN_GATEWAY_UNAVAILABLE_EXIT_CODE
+            return KANBAN_GATEWAY_UNAVAILABLE_EXIT_CODE
         return 1
 
 

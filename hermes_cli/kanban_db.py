@@ -314,6 +314,14 @@ KANBAN_RATE_LIMIT_EXIT_CODE = 75
 # the FIRST occurrence instead of spending ``failure_limit`` identical spawns. 78 == BSD EX_CONFIG.
 KANBAN_TERMINAL_PROVIDER_EXIT_CODE = 78
 
+# Worker exit "the profile owner (gateway) stayed starting/draining past the worker's wait
+# budget": released WITHOUT counting a failure — a cold-booting or momentarily wedged owner is
+# a host condition, not a task defect, and the breaker must never trip on it (#80-blocked-cards
+# incident, 2026-10-21..11-09: 80 cards parked ``blocked`` on "Gateway starting: deadline" after
+# exactly ``failure_limit`` identical spawns, while the owner was simply slow/wedged all day).
+# 69 == BSD EX_UNAVAILABLE.
+KANBAN_GATEWAY_UNAVAILABLE_EXIT_CODE = 69
+
 
 def _resolve_crash_grace_seconds() -> int:
     """``HERMES_KANBAN_CRASH_GRACE_SECONDS`` (0 = immediate, for tests) else default."""
