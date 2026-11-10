@@ -142,6 +142,11 @@ class DispatchResult:
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
     a failure — a long quota window must never trip the circuit breaker."""
+    gateway_unavailable: list[str] = field(default_factory=list)
+    """Task ids whose workers gave up because the profile owner stayed
+    starting/draining past the wait budget (EX_UNAVAILABLE sentinel exit) and
+    were released to ``ready`` WITHOUT counting a failure — a cold-booting or
+    wedged owner is a host condition, not the card's (#80-blocked-cards)."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -170,6 +175,8 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts[reason] = counts.get(reason, 0) + 1
         if res.rate_limited:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
+        if res.gateway_unavailable:
+            counts["gateway_unavailable"] = counts.get("gateway_unavailable", 0) + len(res.gateway_unavailable)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
@@ -251,6 +258,8 @@ def _exit_code_kind(code: int) -> tuple[str, int]:
         return ("rate_limited", code)
     if code == _kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE:
         return ("terminal_provider", code)
+    if code == _kb.KANBAN_GATEWAY_UNAVAILABLE_EXIT_CODE:
+        return ("gateway_unavailable", code)
     return ("nonzero_exit", code)
 
 
@@ -1051,12 +1060,21 @@ class _DeadWorker:
     terminal_provider: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
+    gateway_unavailable: bool = False
+    """``KANBAN_GATEWAY_UNAVAILABLE_EXIT_CODE``: the profile owner was still
+    starting/draining when the worker gave up waiting — a host condition, never
+    counted as a failure (same contract as ``rate_limited``)."""
 
     @property
     def run_outcome(self) -> str:
         # A rate-limited requeue is recorded as ``rate_limited`` so board history
-        # doesn't show a phantom crash for a quota wall.
-        return "rate_limited" if self.rate_limited else "crashed"
+        # doesn't show a phantom crash for a quota wall; a gateway-unavailable
+        # requeue gets its own label for the same reason.
+        if self.rate_limited:
+            return "rate_limited"
+        if self.gateway_unavailable:
+            return "gateway_unavailable"
+        return "crashed"
 
 
 def _classify_dead_worker(
@@ -1124,6 +1142,20 @@ def _classify_dead_worker_exit(
             {"pid": pid, "claimer": claimer, "exit_code": code},
             rate_limited=True,
         )
+    if kind == "gateway_unavailable":
+        # The profile owner (gateway) was still starting/draining when the worker's
+        # OWNER_WAIT_S budget ran out — a host condition (cold boot under load, or a
+        # momentarily wedged owner), NOT a task failure. Requeue without counting it,
+        # same contract as a rate-limit quota wall: otherwise a slow/wedged owner trips
+        # every ready card's breaker in ``failure_limit`` spawns (#80-blocked-cards).
+        return _DeadWorker(
+            kind, code,
+            f"pid {pid} exited after the gateway stayed unavailable (starting/draining) past "
+            "its wait budget — requeued without counting a failure",
+            "gateway_unavailable",
+            {"pid": pid, "claimer": claimer, "exit_code": code},
+            gateway_unavailable=True,
+        )
     if kind == "terminal_provider":
         # The worker classified its own provider failure as unhealable (credential
         # revoked, model gone): every further spawn would hit the same wall, so
@@ -1155,6 +1187,7 @@ class _CrashSweep:
 
     crashed: list[str] = field(default_factory=list)
     rate_limited: list[str] = field(default_factory=list)
+    gateway_unavailable: list[str] = field(default_factory=list)
     # ``(task_id, pid, claimer, dead_worker)``: accounted after the txn via
     # ``_record_task_failure`` (needs its own write_txn).
     crash_details: list[tuple[str, int, str, _DeadWorker]] = field(default_factory=list)
@@ -1222,18 +1255,22 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 "outcome": dead.run_outcome,
                 "retry_status": retry_status,
             })
-            if dead.rate_limited or dead.protocol_violation:
+            if dead.rate_limited or dead.protocol_violation or dead.gateway_unavailable:
                 # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
                 # a rate-limited requeue must show ``check_respawn_guard`` a quota
                 # blocker; a below-budget protocol violation never reaches
                 # ``_record_task_failure`` (which stamps this column), yet the
-                # board UI and retry worker need the corrective message.
+                # board UI and retry worker need the corrective message. Same for a
+                # gateway-unavailable requeue (``check_respawn_guard``'s
+                # ``infrastructure_cooldown`` reads it).
                 conn.execute(
                     "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
                     (dead.error_text[:500], row["id"]),
                 )
             if dead.rate_limited:
                 sweep.rate_limited.append(row["id"])
+            elif dead.gateway_unavailable:
+                sweep.gateway_unavailable.append(row["id"])
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
@@ -1338,6 +1375,7 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     # requeues did NOT count a failure and are NOT crashes.
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
     detect_crashed_workers._last_rate_limited = sweep.rate_limited  # type: ignore[attr-defined]
+    detect_crashed_workers._last_gateway_unavailable = sweep.gateway_unavailable  # type: ignore[attr-defined]
     # Fired only now, after the reclaim txn AND breaker accounting have
     # committed, so subscribers always observe fully durable board state.
     if sweep.exited_hook_payloads and _kb._kanban_observer_consumed("on_kanban_worker_exited"):
@@ -1612,6 +1650,18 @@ def check_respawn_guard(
         # Cooldown elapsed — return early so blocker_auth doesn't catch the
         # stamped rate-limit text; this path intentionally retries forever
         # (spaced by the cooldown) until quota returns or a real run supersedes it.
+        return None
+    if latest_run is not None and latest_run["outcome"] == "gateway_unavailable":
+        # Same shape as the rate-limited case above, and the same cooldown knob: the
+        # owner being slow/wedged is a host condition, not the card's, so this path
+        # also retries forever (spaced) instead of ever reaching blocker_auth or the
+        # breaker (#80-blocked-cards: 80 cards parked ``blocked`` on "Gateway starting:
+        # deadline" because every requeue used to spend the unified failure budget).
+        if rl_cooldown <= 0:
+            return None
+        ended_at = _kb._to_epoch(latest_run["ended_at"])
+        if ended_at is not None and (now - ended_at) < rl_cooldown:
+            return "infrastructure_cooldown"
         return None
 
     # 2. Quota / auth blocker: retrying immediately will not help.  A plain
@@ -2229,6 +2279,7 @@ def _run_reclaim_phase(
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
+    result.gateway_unavailable.extend(getattr(detect_crashed_workers, "_last_gateway_unavailable", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
