@@ -648,6 +648,12 @@ CREATE TABLE IF NOT EXISTS state_meta (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+-- local_lineage_index keeps only reset receipts with more than one segment. The policy store can
+-- contain hundreds of MB of one-segment receipts, and its cache is invalidated by every DB commit;
+-- matching the query predicate here lets SQLite skip those values instead of parsing all of them.
+CREATE INDEX IF NOT EXISTS idx_state_meta_lineage_multi
+    ON state_meta(key)
+    WHERE json_valid(value) AND json_array_length(value, '$.lineage') > 1;
 
 CREATE TABLE IF NOT EXISTS gateway_routing (
     scope TEXT NOT NULL DEFAULT '',

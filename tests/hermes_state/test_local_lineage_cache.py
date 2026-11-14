@@ -41,6 +41,17 @@ def test_unchanged_session_lists_and_counts_scan_receipts_once(db):
     assert len(_receipt_scans(statements)) == 1
 
 
+def test_lineage_receipt_scan_uses_partial_index(db):
+    with db._read_ctx() as conn:
+        plan = conn.execute(
+            "EXPLAIN QUERY PLAN SELECT value FROM state_meta "
+            "WHERE key GLOB ? AND json_valid(value) "
+            "AND json_array_length(value, '$.lineage') > 1",
+            (POLICY_PREFIX + '*',),
+        ).fetchall()
+    assert any('idx_state_meta_lineage_multi' in str(row[3]) for row in plan)
+
+
 @pytest.mark.parametrize('mutation', ['extend', 'retire', 'end_reason', 'delete_head'])
 def test_committed_writer_changes_refresh_the_pooled_reader(db, mutation):
     assert [row['id'] for row in db.list_sessions_rich()] == ['head']
