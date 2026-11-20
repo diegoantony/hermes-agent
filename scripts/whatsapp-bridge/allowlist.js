@@ -78,7 +78,11 @@ export function matchesInboundWhatsAppGroup({
   groupPolicy,
   groupAllowedUsers,
   sessionDir,
+  archiveGroupJids = [],
 }) {
+  // Forward explicitly archived groups to Python's pre-policy journal only.
+  // This is NOT permission to dispatch a turn; Python applies policy afterwards.
+  if (archiveGroupJids.includes(chatId)) return true;
   if (groupPolicy === 'disabled' || groupPolicy === 'pairing') {
     return false;
   }
