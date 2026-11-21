@@ -313,6 +313,58 @@ def test_allow_reply_to_bot_env_fallback(monkeypatch):
 # code is needed, only the ``whatsapp.extra.bot_users`` config entry at activation (Fase B). ---
 
 
+# --- Caso real t_d07cafdf (21/11/2026): "AI Database -- Agentes" sem @mencao nativa ---
+
+
+def test_other_agent_naming_alfred_is_processed_with_free_response_chats():
+    """Reproduz 21/11 11:05: a agente do Jose (559292484004@s.whatsapp.net) escreveu
+    'Alfred, concordo...' no grupo de agentes e o Alfred NAO processou, porque
+    require_mention=true e o grupo nao estava em free_response_chats; o Diego teve
+    que cobrar e o Alfred respondeu manualmente via `hermes send`. Com
+    free_response_chats incluindo o grupo (a correcao aplicada em config.yaml), a
+    mesma mensagem passa a ser processada -- o SOUL do grupo decide calar ou
+    responder (silencio por padrao), sem depender de @mencao nativa."""
+    adapter = _make_adapter(
+        require_mention=True,
+        group_policy="allowlist",
+        group_allow_from=["120363431745698109@g.us"],
+        free_response_chats=["120363431745698109@g.us"],
+    )
+
+    jose_msg = _group_message(
+        "Alfred, concordo com o ponto, mas acho que falta medir o efeito real.",
+        chatId="120363431745698109@g.us",
+        botIds=["238487420813351@lid"],
+    )
+    assert adapter._should_process_message(jose_msg) is True
+
+    # Outro grupo nao fica free-response so porque o nome do bot aparece no texto.
+    other_group_msg = _group_message(
+        "Alfred, voce ja viu isso?",
+        chatId="120363374829939162@g.us",
+        botIds=["238487420813351@lid"],
+    )
+    assert adapter._should_process_message(other_group_msg) is False
+
+
+def test_dm_is_unaffected_by_group_free_response_chats():
+    """free_response_chats e por chat_id de grupo; nao pode liberar DM nenhuma."""
+    adapter = _make_adapter(
+        require_mention=True,
+        group_policy="allowlist",
+        group_allow_from=["120363431745698109@g.us"],
+        free_response_chats=["120363431745698109@g.us"],
+        dm_policy="allowlist",
+        allow_from=["126194729091277@lid"],
+    )
+    dm = _dm_message("Alfred, bom dia", senderId="126194729091277@lid", chatId="126194729091277@lid")
+    dm["from"] = "126194729091277@lid"
+    # DM segue o caminho de _is_dm_intake_allowed (pairing/allowlist), nao o de grupo;
+    # o ponto deste teste e so confirmar que o chat_id do DM nunca cai no set de
+    # free_response_chats (que so contem o JID do grupo de agentes).
+    assert dm["chatId"] not in adapter._whatsapp_free_response_chats()
+
+
 def test_whatsapp_build_source_marks_configured_peer_bots_is_bot():
     """A WhatsApp JID listed in ``extra.bot_users`` is marked ``is_bot`` on its inbound source,
     so ``BotLoopGuard`` (authz_mixin._admit_bot_message/_admit_bot_chain) can cut a reply loop
