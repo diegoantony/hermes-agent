@@ -319,7 +319,9 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 self._hmwa_classify_turn_failure(agent_result, history, session_entry)
             )
             if agent_failed_early and not is_context_overflow_failure:
-                response = self._hmwa_add_failed_turn_notice(response, self._hmwa_failed_turn_notice(agent_result))
+                if not (self._hmwa_is_gateway_drain_interrupt(agent_result)
+                        and self._hmwa_failed_turn_notice(agent_result) == FAILED_TURN_NOTICE):
+                    response = self._hmwa_add_failed_turn_notice(response, self._hmwa_failed_turn_notice(agent_result))
             response, session_entry = await self._hmwa_compression_exhaustion_reset(
                 agent_result, response, session_entry, session_key, source,
             )

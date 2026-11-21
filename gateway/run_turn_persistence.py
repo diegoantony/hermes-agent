@@ -120,8 +120,13 @@ class GatewayTurnPersistenceMixin:
                 logger.debug("clear_resume_pending failed for %s: %s", session_key, _e, exc_info=True)
 
         # Normalize empty responses: surface errors, partial failures, and work-without-text.
-        # Fix for #18765.
-        if not _intentional_silence:
+        # Fix for #18765. A drain-interrupted turn safe to auto-resume (t_e3ed4466) stays silent
+        # here instead: the gateway is about to queue it (``resume_pending``), so "Something went
+        # wrong, use /retry" would be a lie — nobody needs to retry what is already queued.
+        if not _intentional_silence and self._hmwa_is_gateway_drain_interrupt(agent_result) \
+                and self._hmwa_failed_turn_notice(agent_result) == FAILED_TURN_NOTICE:
+            response = ""
+        elif not _intentional_silence:
             response = _normalize_empty_agent_response(agent_result, response, history_len=len(history))
             response = _sanitize_gateway_final_response(source.platform, response)
 
@@ -272,6 +277,22 @@ class GatewayTurnPersistenceMixin:
         ):
             return PARTIAL_FAILED_TURN_NOTICE
         return FAILED_TURN_NOTICE
+
+    @staticmethod
+    def _hmwa_is_gateway_drain_interrupt(agent_result) -> bool:
+        """True iff this turn failed because THIS gateway process interrupted it for its own
+        restart/shutdown drain (``gateway/run.py::_INTERRUPT_REASON_GATEWAY_RESTART/_SHUTDOWN``) —
+        never a user ``/stop``, a provider error, or an automation's own cause. Only this cause
+        makes the turn safe to mark ``resume_pending`` for: a drain-interrupted turn is retried by
+        the SAME code path crash recovery already trusts (gateway/session_recovery.py), so treating
+        it differently here would just be a second mechanism for one concept (t_e3ed4466)."""
+        from gateway.run import _INTERRUPT_REASON_GATEWAY_RESTART, _INTERRUPT_REASON_GATEWAY_SHUTDOWN
+
+        if not agent_result.get("interrupted"):
+            return False
+        return agent_result.get("interrupt_message") in (
+            _INTERRUPT_REASON_GATEWAY_RESTART, _INTERRUPT_REASON_GATEWAY_SHUTDOWN,
+        )
 
     async def _hmwa_close_failed_turn(self, session_id, notice):
         """Append the gateway-owned assistant boundary iff the durable tail is open (a user row, or the
@@ -490,9 +511,19 @@ class GatewayTurnPersistenceMixin:
                     )
                 else:
                     await store.append_to_transcript(sid, _user_row, skip_db=agent_persisted)
-                # Close the failed turn: a user-only tail lets alternation repair merge this request
-                # into an unrelated future message and replay stale side effects (#107070).
-                await self._hmwa_close_failed_turn(sid, self._hmwa_failed_turn_notice(agent_result))
+                # A restart/shutdown drain interrupted this turn before any tool ran: nothing is
+                # unsafe to replay, so mark the session resume_pending (the same contract crash
+                # recovery uses, gateway/session_recovery.py::recover_interrupted_turns) instead of
+                # closing with "Send it again" — a notice nothing ever resends (t_e3ed4466). A turn
+                # that already ran a tool keeps the current close-with-notice behaviour: its effects
+                # may be real, so only a human re-reading PARTIAL_FAILED_TURN_NOTICE should decide.
+                if session_key and self._hmwa_is_gateway_drain_interrupt(agent_result) \
+                        and self._hmwa_failed_turn_notice(agent_result) == FAILED_TURN_NOTICE:
+                    await self.async_session_store.mark_resume_pending(session_key, "restart_interrupted")
+                else:
+                    # Close the failed turn: a user-only tail lets alternation repair merge this
+                    # request into an unrelated future message and replay stale side effects (#107070).
+                    await self._hmwa_close_failed_turn(sid, self._hmwa_failed_turn_notice(agent_result))
             else:
                 # Only the NEW messages: history_offset (what the agent saw), not len(history), which
                 # counts session_meta entries stripped before the agent saw them.
