@@ -393,7 +393,9 @@ function enqueuePollUpdateEvent({ key, update, selectedOptions, aggregation }) {
   };
   messageQueue.push(event);
   if (messageQueue.length > MAX_QUEUE_SIZE) {
-    messageQueue.shift();
+    const dropped = messageQueue.shift();
+    logger.warn({ dropped: { chatId: dropped?.chatId, senderId: dropped?.senderId, timestamp: dropped?.timestamp, nativeType: dropped?.nativeType } },
+      'messageQueue overflow: dropping oldest queued event (Python gateway not polling /messages fast enough)');
   }
 }
 
@@ -868,7 +870,9 @@ async function startSocket() {
         queueLength: messageQueue.length,
       });
       if (messageQueue.length > MAX_QUEUE_SIZE) {
-        messageQueue.shift();
+        const dropped = messageQueue.shift();
+        logger.warn({ dropped: { chatId: dropped?.chatId, senderId: dropped?.senderId, timestamp: dropped?.timestamp, body: (dropped?.body || '').slice(0, 80) } },
+          'messageQueue overflow: dropping oldest queued event (Python gateway not polling /messages fast enough)');
       }
     }
   });
