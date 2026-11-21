@@ -68,6 +68,7 @@ PLATFORMS = {k: {"label": info.label, "default_toolset": info.default_toolset} f
 # Toolsets shown in the configurator: (toolset key in toolsets.py TOOLSETS, label, description).
 CONFIGURABLE_TOOLSETS = [
     ("web",             "🔍 Web Search & Scraping",    "web_search, web_extract"),
+    ("web_extract",     "📄 Web Extract (read-only)",  "web_extract only: no search, no form submission"),
     ("browser",         "🌐 Browser Automation",       "navigate, click, type, scroll"),
     ("terminal",        "💻 Terminal & Processes",      "terminal, process"),
     ("file",            "📁 File Operations",           "read, write, patch, search"),
@@ -113,6 +114,11 @@ _DEFAULT_OFF_TOOLSETS = {"spotify", "discord", "discord_admin", "video", "video_
 # Config-only capabilities: provider setup in `hermes tools` (TOOL_CATEGORIES) but not model toolsets — zero
 # schemas, own switch (``stt.enabled``), never in ``platform_toolsets`` or the per-platform checklist.
 _CONFIG_ONLY_TOOLSETS = {"stt"}
+
+# Narrow toolsets whose tools are a strict subset of another configurable toolset (``web_extract`` ⊂ ``web``):
+# a row in the checklist and honored on an explicit save, but never inferred from a composite — otherwise every
+# platform running ``hermes-<platform>`` would report both ``web`` and ``web_extract`` enabled.
+_EXPLICIT_ONLY_TOOLSETS = {"web_extract"}
 
 
 def _xai_credentials_present() -> bool:
@@ -461,7 +467,8 @@ def _configurable_subset_of(tool_names: set[str], platform: str) -> set[str]:
     from toolsets import resolve_toolset
 
     return {
-        ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS if _toolset_allowed_for_platform(ts_key, platform)
+        ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS if ts_key not in _EXPLICIT_ONLY_TOOLSETS
+        and _toolset_allowed_for_platform(ts_key, platform)
         and (ts_tools := set(resolve_toolset(ts_key, include_registry=False))) and ts_tools <= tool_names}
 
 

@@ -151,6 +151,7 @@ const WHATSAPP_GROUP_POLICY = String(process.env.WHATSAPP_GROUP_POLICY || 'pairi
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
 // Group authorization is by group JID, not by every participant's JID.  The
 // Python adapter still applies group policy and mention rules after intake.
+const ARCHIVE_GROUP_JIDS = JSON.parse(process.env.HERMES_WHATSAPP_ARCHIVE_GROUP_JIDS || '[]');
 const GROUP_ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_GROUP_ALLOWED_USERS || '');
 const DEFAULT_REPLY_PREFIX = '☤ *Hermes Agent*\n────────────\n';
 const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
@@ -726,6 +727,7 @@ async function startSocket() {
               chatId,
               groupPolicy: WHATSAPP_GROUP_POLICY,
               groupAllowedUsers: GROUP_ALLOWED_USERS,
+              archiveGroupJids: ARCHIVE_GROUP_JIDS,
               sessionDir: SESSION_DIR,
             })
           : WHATSAPP_DM_POLICY === 'pairing'
@@ -811,7 +813,9 @@ async function startSocket() {
         senderNumber,
         botIds,
         isGroup,
-        downloadMedia: async (mediaMsg) => downloadMediaMessage(mediaMsg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage }),
+        // Archive-only intake keeps attachment metadata, never downloads payloads.
+        downloadMedia: ARCHIVE_GROUP_JIDS.includes(chatId) && !matchesAllowedUser(chatId, GROUP_ALLOWED_USERS, SESSION_DIR)
+          ? undefined : async (mediaMsg) => downloadMediaMessage(mediaMsg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage }),
         cacheDirs: {
           image: IMAGE_CACHE_DIR,
           document: DOCUMENT_CACHE_DIR,

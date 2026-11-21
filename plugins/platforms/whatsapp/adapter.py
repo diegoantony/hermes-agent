@@ -606,7 +606,7 @@ _BRIDGE_PASSTHROUGH_ENV = (
 # _bridge_env() resolves itself (mode mirrors the --mode argv). Adoption must verify all of it,
 # or a policy/allowlist edit lands only after the bridge is killed by hand (#126824).
 _BRIDGE_CONSUMED_ENV = _BRIDGE_PASSTHROUGH_ENV + (
-    "WHATSAPP_MODE", "WHATSAPP_REPLY_PREFIX", "WHATSAPP_SEND_READ_RECEIPTS",
+    "WHATSAPP_MODE", "WHATSAPP_REPLY_PREFIX", "WHATSAPP_SEND_READ_RECEIPTS", "HERMES_WHATSAPP_ARCHIVE_GROUP_JIDS",
     "HERMES_IMAGE_CACHE_DIR", "HERMES_AUDIO_CACHE_DIR", "HERMES_DOCUMENT_CACHE_DIR",
 )
 _BRIDGE_FINGERPRINT_FILE = "bridge.env-fingerprint"
@@ -693,6 +693,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     def _bridge_req(self, method: str, path: str, timeout: float, **kwargs):
         """``session.<method>`` context manager for a bridge endpoint (caller must ``async with``)."""
         import aiohttp
+        from .group_archive import archive_only
+
+        if method.lower() != "get" and archive_only(self.config.extra, str((kwargs.get("json") or {}).get("chatId") or "")):
+            raise ValueError("Cannot send to archive-only group")
         return getattr(self._http_session, method)(self._bridge_url(path), **kwargs, timeout=aiohttp.ClientTimeout(total=timeout))
 
     async def _probe_bridge_health(self) -> tuple[bool, Any]:
@@ -834,6 +838,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             bridge_env["WHATSAPP_REPLY_PREFIX"] = self._reply_prefix
         else:
             bridge_env.pop("WHATSAPP_REPLY_PREFIX", None)
+        import json
+        bridge_env["HERMES_WHATSAPP_ARCHIVE_GROUP_JIDS"] = json.dumps(extra_jids := self.config.extra.get("archive_group_jids", []))
+        if not isinstance(extra_jids, list) or any(not isinstance(jid, str) or not re.fullmatch(r"[0-9]+@g\.us", jid) for jid in extra_jids):
+            raise ValueError("archive_group_jids must be an explicit list of group JIDs")
         bridge_env["WHATSAPP_SEND_READ_RECEIPTS"] = "true" if self._send_read_receipts else "false"
         bridge_env["HERMES_WHATSAPP_BRIDGE_TOKEN"] = self._bridge_token
         for _key, _v in [("WHATSAPP_MODE", _wenv("WHATSAPP_MODE", "self-chat"))] + [(k, _wenv(k)) for k in _BRIDGE_PASSTHROUGH_ENV]:
@@ -1293,6 +1301,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         return await self._send_media_to_bridge(chat_id, file_path, "document", caption, file_name or os.path.basename(file_path))
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
+        from .group_archive import archive_only
+        if archive_only(self.config.extra, to_whatsapp_jid(chat_id)):
+            return
         if await self._bridge_unavailable():
             return
         with suppress(Exception):
@@ -1348,6 +1359,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             await asyncio.sleep(1)  # Poll interval
 
     async def _process_inbound(self, msg_data: dict[str, Any]) -> None:
+        from .group_archive import append_group_message, archive_only
+
+        if self.config.extra.get("archive_group_jids"):
+            append_group_message(self._profile_home, self.config.extra, msg_data)
+        if archive_only(self.config.extra, str(msg_data.get("chatId") or "")):
+            return
         event = await self._build_message_event(msg_data)
         if event:
             # Fire-and-forget: a slow bridge /read must not delay dispatch.
@@ -1557,6 +1574,9 @@ def _normalize_outbound_mentions(mentions: list[str] | None) -> list[str]:
 async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_files=None, force_document=False,
                            caption=None, mentions=None):
     """Out-of-process delivery via the bridge HTTP API (standalone_sender_fn: cron apart from the gateway); ``caption`` rides on the media bubble."""
+    from .group_archive import archive_only
+    if archive_only(getattr(pconfig, "extra", {}) or {}, to_whatsapp_jid(chat_id)):
+        return send_error("Cannot send to archive-only group")
     try:
         import aiohttp
     except ImportError:

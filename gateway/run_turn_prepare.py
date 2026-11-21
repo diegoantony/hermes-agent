@@ -782,7 +782,16 @@ class GatewayTurnPrepareMixin:
         from tools.approval_yolo import restore_gateway_yolo
         _was_auto_reset, _is_new_session = await self._hmwa_open_session(session_entry, session_key, source)
         restore_gateway_yolo(session_key, session_entry.yolo)  # None: TurnRunner seeds the launch policy
-        context = build_session_context(source, self.config, session_entry, event)
+        # The ephemeral prompt must reflect the profile that OWNS this turn, not the launch/default
+        # profile's config: under multiplexing a routed secondary (e.g. a WhatsApp-group profile)
+        # would otherwise leak the default profile's Connected Platforms, home channels and delivery
+        # options into the routed profile's system prompt (#140522). ``_async_profile_scope_for_source``
+        # is a no-op outside multiplexing, so ``routed_config`` is ``self.config`` there.
+        async with self._async_profile_scope_for_source(source):
+            from gateway.config import load_gateway_config as _load_routed_gateway_config
+            routed_config = _load_routed_gateway_config() if self._profile_scope_key_for_source(source) is not None \
+                else self.config
+            context = build_session_context(source, routed_config, session_entry, event)
         # Session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
         # Self-injected turns (internal=True) persist with a DB-only display_kind: timeline notices, not user bubbles.

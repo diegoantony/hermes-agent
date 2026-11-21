@@ -95,6 +95,20 @@ class WhatsAppBehaviorMixin(OwnAccessPolicyMixin):
             return configured.lower() in _TRUTHY
         return bool(configured)
 
+    def _whatsapp_allow_reply_to_bot(self) -> bool:
+        """``extra.allow_reply_to_bot`` (default true: unchanged behavior) else the scoped env.
+
+        With ``require_mention=true``, a plain reply to the bot's own message is a trigger by
+        default. Setting this false removes that trigger so only an explicit @mention, a slash
+        command or a configured mention pattern can start a turn in a group — e.g. a multi-agent
+        group chat where other agents keep replying to this bot's messages (#140523)."""
+        configured = self.config.extra.get("allow_reply_to_bot")
+        if configured is None:
+            configured = _get_wsecret("WHATSAPP_ALLOW_REPLY_TO_BOT", default="true") or "true"
+        if isinstance(configured, str):
+            return configured.lower() in _TRUTHY
+        return bool(configured)
+
     def _whatsapp_free_response_chats(self) -> set[str]:
         """``extra.free_response_chats`` (blank = unset) else the scoped env CSV."""
         return self._coerce_allow_list(
@@ -260,7 +274,7 @@ class WhatsAppBehaviorMixin(OwnAccessPolicyMixin):
             return True
         return (
             str(data.get("body") or "").strip().startswith("/")
-            or self._message_is_reply_to_bot(data)
+            or (self._whatsapp_allow_reply_to_bot() and self._message_is_reply_to_bot(data))
             or self._message_mentions_bot(data)
             or spoken_mention
             or self._message_matches_mention_patterns(data)

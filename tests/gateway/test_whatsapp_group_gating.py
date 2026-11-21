@@ -5,7 +5,8 @@ from gateway.config import Platform, PlatformConfig, load_gateway_config
 
 
 def _make_adapter(require_mention=None, mention_patterns=None, free_response_chats=None,
-                  dm_policy=None, allow_from=None, group_policy=None, group_allow_from=None):
+                  dm_policy=None, allow_from=None, group_policy=None, group_allow_from=None,
+                  allow_reply_to_bot=None):
     from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
 
     extra = {}
@@ -23,6 +24,8 @@ def _make_adapter(require_mention=None, mention_patterns=None, free_response_cha
         extra["group_policy"] = group_policy
     if group_allow_from is not None:
         extra["group_allow_from"] = group_allow_from
+    if allow_reply_to_bot is not None:
+        extra["allow_reply_to_bot"] = allow_reply_to_bot
 
     adapter = object.__new__(WhatsAppAdapter)
     adapter.platform = Platform.WHATSAPP
@@ -259,3 +262,73 @@ def test_device_qualified_bot_ids_match_bare_mention_and_quote_ids():
         _group_message("and this?", botIds=device_qualified, quotedParticipant="447999674698@s.whatsapp.net")
     ) is True
     assert adapter._should_process_message(_group_message("hello everyone", botIds=device_qualified)) is False
+
+
+# --- Q8: allow_reply_to_bot (anti-loop: disable reply-to-bot as a group trigger) ---
+
+
+def test_reply_to_bot_triggers_by_default_unchanged_behavior():
+    """No ``allow_reply_to_bot`` key set: reply-to-bot keeps triggering (current behavior)."""
+    adapter = _make_adapter(require_mention=True, group_policy="open")
+
+    assert adapter._should_process_message(
+        _group_message("replying", quotedParticipant="15551230000@lid")
+    ) is True
+
+
+def test_allow_reply_to_bot_false_disables_reply_trigger_but_keeps_mention():
+    """With the new key off: a plain reply to the bot no longer triggers a turn, but an
+    explicit @mention and slash commands still do — this is the fix for Q8 (anti-loop)."""
+    adapter = _make_adapter(require_mention=True, group_policy="open", allow_reply_to_bot=False)
+
+    assert adapter._should_process_message(
+        _group_message("replying", quotedParticipant="15551230000@lid")
+    ) is False
+    assert adapter._should_process_message(
+        _group_message("hi there", mentionedIds=["15551230000@s.whatsapp.net"])
+    ) is True
+    assert adapter._should_process_message(_group_message("/status")) is True
+    assert adapter._should_process_message(_group_message("hello everyone")) is False
+
+
+def test_allow_reply_to_bot_env_fallback(monkeypatch):
+    """``extra.allow_reply_to_bot`` unset falls through to ``WHATSAPP_ALLOW_REPLY_TO_BOT``."""
+    from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
+
+    monkeypatch.setenv("WHATSAPP_ALLOW_REPLY_TO_BOT", "false")
+    adapter = object.__new__(WhatsAppAdapter)
+    adapter.config = PlatformConfig(enabled=True, extra={})
+    assert adapter._whatsapp_allow_reply_to_bot() is False
+
+    monkeypatch.setenv("WHATSAPP_ALLOW_REPLY_TO_BOT", "true")
+    assert adapter._whatsapp_allow_reply_to_bot() is True
+
+    monkeypatch.delenv("WHATSAPP_ALLOW_REPLY_TO_BOT", raising=False)
+    assert adapter._whatsapp_allow_reply_to_bot() is True  # default: unchanged behavior
+
+
+# --- Anti-loop: configured peer bots must not trigger an unbounded exchange.
+# WhatsApp inherits ``BasePlatformAdapter.build_source``'s generic ``bot_users`` -> ``is_bot``
+# marking (same mechanism already proven for Mattermost/Signal, #137027); no WhatsApp-specific
+# code is needed, only the ``whatsapp.extra.bot_users`` config entry at activation (Fase B). ---
+
+
+def test_whatsapp_build_source_marks_configured_peer_bots_is_bot():
+    """A WhatsApp JID listed in ``extra.bot_users`` is marked ``is_bot`` on its inbound source,
+    so ``BotLoopGuard`` (authz_mixin._admit_bot_message/_admit_bot_chain) can cut a reply loop
+    even though reply-to-bot stays enabled (peer bots may interact, while the
+    exchange must end)."""
+    adapter = _make_adapter(group_policy="open")
+    adapter.config.extra["bot_users"] = ["15559998888@s.whatsapp.net"]
+    adapter.gateway_runner = None
+
+    peer_source = adapter.build_source(
+        chat_id="120363001234567890@g.us", chat_type="group",
+        user_id="15559998888@s.whatsapp.net", user_name="Other Agent",
+    )
+    human_source = adapter.build_source(
+        chat_id="120363001234567890@g.us", chat_type="group",
+        user_id="34612345678@s.whatsapp.net", user_name="Human",
+    )
+    assert peer_source.is_bot is True
+    assert human_source.is_bot is False
