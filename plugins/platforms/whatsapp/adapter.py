@@ -1538,6 +1538,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 metadata["whatsapp_from_owner"] = True
                 if not body.startswith(_OWNER_REPLY_PREFIX):
                     body = f"{_OWNER_REPLY_PREFIX}{body}"
+            profile_home = getattr(self, "_profile_home", None)
+            if data.get("isGroup") and profile_home is not None:
+                from .group_archive import inject_context
+                body = inject_context(profile_home, self.config.extra, data, body)
             return MessageEvent(
                 text=body, message_type=msg_type, source=source, raw_message=data, message_id=data.get("messageId"),
                 media_urls=cached_urls, media_types=media_types, media_text_inlined=media_text_inlined, metadata=metadata,
