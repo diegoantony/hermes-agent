@@ -244,6 +244,24 @@ class GatewayInboundMixin(
             elif pairable_dm:
                 await self._hm_report_ignored_dm(source)
             else:
+                # TEMP instrumentation for t_22a01f7b (WhatsApp group intermittent
+                # "Unauthorized user" despite correct bot_users/group_allow_from).
+                # Safe to remove once the next live rejection is captured: read-only,
+                # no behavior change, same log level already enabled in production.
+                with suppress(Exception):
+                    from gateway.session_identity import identity_of
+                    _ident = identity_of(source)
+                    _diag = {
+                        "transport_profile": getattr(_ident, "transport_profile", None),
+                        "runtime_profile": getattr(_ident, "runtime_profile", None),
+                        "authorization_home": str(getattr(_ident, "authorization_home", None)),
+                        "multiplexed": getattr(_ident, "multiplexed", None),
+                    }
+                    if source.platform == Platform.WHATSAPP:
+                        from gateway.whatsapp_identity import expand_whatsapp_aliases
+                        _diag["aliases_found"] = sorted(expand_whatsapp_aliases(str(source.user_id)))
+                    logger.warning("Unauthorized user diag (t_22a01f7b): %s on %s identity=%s",
+                                   source.user_id, source.platform.value, _diag)
                 logger.warning("Unauthorized user: %s on %s", source.user_id, source.platform.value)
             return None
         # The busy path charged this event on arrival; a drained follow-up must not pay twice.
