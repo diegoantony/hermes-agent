@@ -332,3 +332,89 @@ def test_whatsapp_build_source_marks_configured_peer_bots_is_bot():
     )
     assert peer_source.is_bot is True
     assert human_source.is_bot is False
+
+
+# --- t_d07cafdf (22/11/2026): gatilho por nome via mention_patterns, SEM free_response_chats ---
+# (requisito do Diego: "Alfred" em texto puro abre turno; mensagem sem o nome continua calada —
+# diferente da tentativa anterior com free_response_chats, que deixava tudo passar.)
+
+
+def test_mention_pattern_name_trigger_without_free_response_chats_opens_turn():
+    """``mention_patterns: ['\\\\bAlfred\\\\b']`` com require_mention=true e SEM
+    free_response_chats: uma mensagem de outro agente (bot_user) citando 'Alfred' em texto
+    puro (sem @menção nativa) deve processar; a mesma mensagem sem o nome não deve."""
+    adapter = _make_adapter(
+        require_mention=True,
+        group_policy="allowlist",
+        group_allow_from=["120363431745698109@g.us"],
+        mention_patterns=[r"\bAlfred\b"],
+    )
+    assert adapter._whatsapp_free_response_chats() == set()
+
+    named = _group_message(
+        "Alfred, concordo com o ponto, mas falta medir o efeito real.",
+        chatId="120363431745698109@g.us",
+        botIds=["238487420813351@lid"],
+    )
+    assert adapter._should_process_message(named) is True
+
+    unnamed = _group_message(
+        "combinado, bora seguir com isso então",
+        chatId="120363431745698109@g.us",
+        botIds=["238487420813351@lid"],
+    )
+    assert adapter._should_process_message(unnamed) is False
+
+    # Case-insensitive (``_compile_mention_patterns`` always compiles with re.IGNORECASE).
+    lowercase_named = _group_message("alfred, bom dia", chatId="120363431745698109@g.us",
+                                      botIds=["238487420813351@lid"])
+    assert adapter._should_process_message(lowercase_named) is True
+
+    # Substring false positive guard: word-boundary must not fire on "Alfredo".
+    substring_only = _group_message("Alfredo ficou de ligar mais tarde", chatId="120363431745698109@g.us",
+                                     botIds=["238487420813351@lid"])
+    assert adapter._should_process_message(substring_only) is False
+
+    # Outro grupo não vira free-response só porque o nome aparece.
+    other_group = _group_message("Alfred, viu isso?", chatId="120363374829939162@g.us",
+                                  botIds=["238487420813351@lid"])
+    assert adapter._should_process_message(other_group) is False
+
+
+def test_mention_pattern_name_trigger_combined_with_bot_loop_guard_cutoff():
+    """Mesmo quando 'Alfred' aciona o turno, o BotLoopGuard real continua cortando uma
+    sequência de mensagens de bot acima do orçamento (requisito 3: corte de loop)."""
+    from gateway.bot_loop_guard import BotLoopGuard, BotLoopGuardSettings
+
+    adapter = _make_adapter(
+        require_mention=True,
+        group_policy="allowlist",
+        group_allow_from=["120363431745698109@g.us"],
+        mention_patterns=[r"\bAlfred\b"],
+    )
+    adapter.config.extra["bot_users"] = ["238487420813351@lid"]
+    adapter.gateway_runner = None
+
+    bot_source = adapter.build_source(
+        chat_id="120363431745698109@g.us", chat_type="group",
+        user_id="238487420813351@lid", user_name="ISA",
+    )
+    assert bot_source.is_bot is True
+
+    msg = _group_message("Alfred, confirma?", chatId="120363431745698109@g.us",
+                          botIds=["238487420813351@lid"])
+    assert adapter._should_process_message(msg) is True
+
+    guard = BotLoopGuard(settings=lambda: BotLoopGuardSettings(
+        enabled=True, max_events=2, window_seconds=10, cooldown_seconds=20, max_hops=2))
+    conversation = ("whatsapp", "120363431745698109@g.us")
+    results = []
+    for i in range(4):
+        allowed, state = guard.chain_admit(conversation, "238487420813351@lid",
+                                            f"Alfred, confirma {i}?", is_bot=bot_source.is_bot)
+        results.append((allowed, state))
+    # First two hops pass the chain, then max_hops cuts the rest — the guard never lets an
+    # unbounded bot-to-bot exchange through regardless of the name trigger.
+    assert results[0][0] is True and results[1][0] is True
+    assert results[2] == (False, "max_hops")
+    assert results[3] == (False, "max_hops")
