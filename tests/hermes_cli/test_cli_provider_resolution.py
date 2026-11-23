@@ -389,6 +389,66 @@ def test_fallback_runtime_labels_quota_outage_and_bad_credentials_distinctly(mon
     assert absent not in printed[-1]
 
 
+def test_fallback_runtime_forces_visibility_when_model_was_explicitly_pinned(monkeypatch, tmp_path, capsys):
+    """A user-pinned `-m` silently losing its provider must always surface, even when the
+    warning_notifications gate would otherwise suppress cli.startup.switching_to_fallback
+    (#t_27f82e9d: Fable 5.1 ran 77 min on gpt-5.6-sol/openai-codex with no visible warning)."""
+    from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr("cli._cprint", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **kw: {"provider": "openai-codex", "base_url": "http://x/v1", "api_key": "k"},
+    )
+    monkeypatch.setattr("hermes_cli.fallback_config.resolve_entry_api_key", lambda entry: "k")
+    # Simulate the notification gate being closed (e.g. gateway.run platform=local with
+    # warning_notifications disabled) — this is exactly what let the switch run silently.
+    monkeypatch.setattr(
+        "gateway.warning_notifications.warning_notifications_enabled", lambda *a, **k: False)
+
+    shell = CLIAgentSetupMixin.__new__(CLIAgentSetupMixin)
+    shell._fallback_model = [{"provider": "openai-codex", "model": "gpt-5.6-sol"}]
+    shell._explicit_model_override = True
+    shell.tool_progress_mode = "full"
+    runtime = shell._resolve_fallback_runtime(AuthError("no key", provider="anthropic", code="missing_api_key"))
+
+    assert runtime is not None
+    out = capsys.readouterr()
+    assert "openai-codex" in out.out
+    assert "gpt-5.6-sol" in out.out
+
+
+def test_fallback_runtime_does_not_force_print_without_explicit_pin(monkeypatch, tmp_path, capsys):
+    """Without an explicit -m pin, a gated-off switch notice stays suppressed as before —
+    the forced-visibility path is scoped to the user's stated model intent only."""
+    from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr("cli._cprint", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **kw: {"provider": "openai-codex", "base_url": "http://x/v1", "api_key": "k"},
+    )
+    monkeypatch.setattr("hermes_cli.fallback_config.resolve_entry_api_key", lambda entry: "k")
+    monkeypatch.setattr(
+        "gateway.warning_notifications.warning_notifications_enabled", lambda *a, **k: False)
+
+    shell = CLIAgentSetupMixin.__new__(CLIAgentSetupMixin)
+    shell._fallback_model = [{"provider": "openai-codex", "model": "gpt-5.6-sol"}]
+    shell._explicit_model_override = False
+    shell.tool_progress_mode = "full"
+    runtime = shell._resolve_fallback_runtime(AuthError("no key", provider="anthropic", code="missing_api_key"))
+
+    assert runtime is not None
+    out = capsys.readouterr()
+    assert out.out == ""
+
+
 def test_ensure_runtime_credentials_records_quota_vs_bad_key(monkeypatch, tmp_path):
     """Kanban workers need this flag: a quota wall at startup is not a worker failure (#117482)."""
     from hermes_cli.auth import AuthError
