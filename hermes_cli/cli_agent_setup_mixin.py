@@ -402,10 +402,19 @@ class CLIAgentSetupMixin:
                 logger.warning(
                     "Primary provider %s (%s). Falling through to fallback: %s/%s",
                     _why_log, primary_exc, _fb_provider, _fb_model)
+                _switch_msg = t(
+                    "cli.startup.switching_to_fallback", reason=_why, provider=_fb_provider, model=_fb_model)
                 from gateway.warning_notifications import render_notification
-                render_notification(
-                    lambda: _cprint(t("cli.startup.switching_to_fallback", reason=_why, provider=_fb_provider, model=_fb_model)),
-                    platform="cli")
+                _shown = render_notification(lambda: _cprint(_switch_msg), platform="cli")
+                # An explicit -m/--model pin is the user's stated intent for this run (#131792:
+                # Fable 5.1 audit silently ran 77 min on gpt-5.6-sol/openai-codex because the
+                # warning_notifications gate suppressed cli.startup.switching_to_fallback). A
+                # pinned model switching provider is not a suppressible diagnostic — force it onto
+                # stdout/stderr even when the notification gate stayed quiet, so quiet/stream-json
+                # runs still see the effective model changed underneath the pin.
+                if getattr(self, "_explicit_model_override", False) and not _shown:
+                    _dest = sys.stderr if getattr(self, "tool_progress_mode", "full") == "off" else sys.stdout
+                    print(_switch_msg, file=_dest)
                 self.requested_provider = _fb_provider
                 self.model = _fb_model
                 # reasoning_config follows the swap in _ensure_runtime_credentials (the only caller).
