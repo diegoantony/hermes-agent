@@ -409,10 +409,15 @@ _STATIC_FAMILY_PREFIXES = {
     # `llama-3.1-8b`) here turns what should be an actionable "did you mean --provider <x>?" error into a
     # confusing success that 400s on the next turn. Only soft- accept names that share the provider's family
     # prefix; reject the rest with guidance to pin the right provider.
+    "anthropic": ("claude-",),
     "openai-codex": ("gpt-", "codex-", "o1", "o3", "o4"),
     "xai-oauth": ("grok-",),
 }
-_STATIC_LABELS = {"openai-codex": "OpenAI Codex", "xai-oauth": "xAI Grok OAuth (SuperGrok / Premium+)"}
+_STATIC_LABELS = {
+    "anthropic": "Anthropic",
+    "openai-codex": "OpenAI Codex",
+    "xai-oauth": "xAI Grok OAuth (SuperGrok / Premium+)",
+}
 
 
 def _family_head(model_id: str) -> str:

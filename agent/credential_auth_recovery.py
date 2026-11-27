@@ -155,10 +155,16 @@ def recover_auth_failure(agent, pool, *, status_code, has_retried_429, error_con
         if state["refreshes"] > _MAX_AUTH_REFRESH_ATTEMPTS:
             log.warning(
                 "Credential auth failure persists after %s refreshes for "
-                "pool entry %s — treating as unrecoverable and allowing "
-                "fallback to activate.", state["refreshes"] - 1, refreshed_id,
+                "pool entry %s — rotating to the next pool entry before falling "
+                "back to a different provider (t_b8c9a019: a second same-provider "
+                "account must be tried before provider-level fallback).",
+                state["refreshes"] - 1, refreshed_id,
             )
-            return False, has_retried_429
+            # Mark THIS entry exhausted and let the pool's priority order pick the next one
+            # (e.g. a second Claude OAuth account) — provider-level fallback (a different
+            # provider/model entirely) is the LAST resort, not the first one tried after a
+            # same-entry refresh gives up.
+            return (True, False) if rotate_and_swap(401, "auth refresh exhausted") else (False, has_retried_429)
     log.info("Credential auth failure — refreshed pool entry %s", refreshed_id or "?")
     if agent._swap_credential(refreshed) is False:
         return False, has_retried_429

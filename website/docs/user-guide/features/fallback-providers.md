@@ -15,6 +15,18 @@ Hermes Agent has three layers of resilience that keep your sessions running when
 
 Credential pools handle same-provider rotation (e.g., multiple OpenRouter keys). This page covers cross-provider fallback. Both are optional and work independently.
 
+:::info Layer order is mandatory, not a tiebreaker
+An auth failure (401/403) on your primary pool entry always exhausts **every** entry of the
+**same** provider — e.g. a second Claude OAuth login — before the primary model fallback chain
+(layer 2, a *different* provider such as Codex/GPT) is ever consulted. A persistent auth failure
+that keeps "succeeding" its own token refresh (the credential is valid, the server keeps
+rejecting it) still rotates to the next same-provider entry once the refresh cap is hit — it does
+not give up and jump straight to a different-provider fallback while a live same-provider
+credential remains. This is enforced in code (`agent/credential_auth_recovery.py`), not just
+policy — see the regression tests in `tests/agent/test_credential_pool_routing.py`
+(`TestSecondAccountBeforeProviderFallback`).
+:::
+
 ## Primary Model Fallback
 
 When your main LLM provider encounters errors — rate limits, server overload, auth failures, connection drops — Hermes can automatically switch to a backup provider:model pair mid-session without losing your conversation.

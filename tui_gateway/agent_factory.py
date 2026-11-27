@@ -167,6 +167,23 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
             # The route is gone with its endpoint and wire: on the default provider they would send
             # that provider's credentials to the stored URL.
             provider = base_url = api_mode = ""
+    # Fail closed on an incoherent persisted pair (t_b8c9a019 / fca385d6dca): a routable provider
+    # (e.g. "anthropic") is not proof the STORED model belongs to it — a prior update/fallback bug,
+    # or a gateway_runtime snapshot taken mid-fallback, can persist "anthropic" + "gpt-6-1-sol".
+    # Resume restores this straight into the live agent with no further check before the primary
+    # turn's first network call (unlike session.create, which model_override_conflict guards) —
+    # so without this check every resumed turn on that session 404s, not just vision/auxiliary.
+    # Drop the pair the same way an unhealed stale provider is dropped above: the session rebuilds
+    # from the profile's current config/fallback instead of resurrecting a broken pin.
+    if provider and model:
+        from hermes_cli.models_validate import static_model_provider_conflict
+        conflict = static_model_provider_conflict(model, provider)
+        if conflict is not None:
+            logger.warning(
+                "dropping incoherent persisted session runtime %r/%r on resume: %s",
+                provider, model, conflict["message"])
+            provider = base_url = api_mode = ""
+            model = ""
     if model:
         # Same dict-shaped override live /model switches use, so a DB-restored session keeps custom endpoint
         # metadata across resume and rebuilds (/new). Raw api_key is never persisted/restored.

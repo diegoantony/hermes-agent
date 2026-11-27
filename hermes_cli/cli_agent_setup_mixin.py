@@ -386,10 +386,26 @@ class CLIAgentSetupMixin:
             if not _fb_provider or not _fb_model:
                 continue
             try:
-                from hermes_cli.fallback_config import fallback_entry_runtime_kwargs
+                from hermes_cli.fallback_config import effective_runtime_provider, resolve_entry_api_key
                 # target_model: the fallback entry names the model that will be sent; without it the
                 # ladder keys off config `default` (see _ensure_runtime_credentials, #112600).
-                runtime = resolve_runtime_provider(**fallback_entry_runtime_kwargs(_fb))
+                _fb_kwargs = {"requested": _fb_provider, "target_model": _fb_model}
+                if _fb.get("base_url"):
+                    _fb_kwargs["explicit_base_url"] = _fb["base_url"]
+                _fb_api_key = resolve_entry_api_key(_fb)
+                if _fb_api_key:
+                    _fb_kwargs["explicit_api_key"] = _fb_api_key
+                runtime = resolve_runtime_provider(**_fb_kwargs)
+                runtime["provider"] = effective_runtime_provider(_fb, runtime) or _fb_provider
+                from hermes_cli.auth import _plugin_aliases
+                _fb_provider_canonical = _plugin_aliases().get(_fb_provider, _fb_provider)
+                if runtime["provider"] != _fb_provider_canonical and _fb_provider != "custom":
+                    # Never send the entry's model through a provider the entry did not declare.
+                    logger.warning(
+                        "Fallback entry %s/%s resolved to provider %r instead; refusing the "
+                        "incoherent pair and trying the next fallback entry",
+                        _fb_provider, _fb_model, runtime["provider"])
+                    continue
                 _why_log, _why = primary_failure_wording(primary_exc)  # #117482: quota is not auth
                 logger.warning(
                     "Primary provider %s (%s). Falling through to fallback: %s/%s",

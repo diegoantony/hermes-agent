@@ -501,3 +501,125 @@ class TestFailureAttribution:
         failed = {e.id: e for e in pool.entries()}["cred-1"]
         assert failed.failure_reason != "billing"
 
+
+# ---------------------------------------------------------------------------
+# 8. Second same-provider OAuth account before provider-level fallback
+#    (t_b8c9a019: Claude account 1 -> Claude account 2 -> Codex, in that order)
+# ---------------------------------------------------------------------------
+
+class TestSecondAccountBeforeProviderFallback:
+    """A persistent 401 on OAuth entry 1 must rotate to OAuth entry 2 of the SAME
+    provider before the caller ever reaches a different-provider fallback. No real
+    network/tokens are used: ``try_refresh_matching`` is a transport-free stub that
+    mimics the documented failure mode ("reports success even when upstream keeps
+    rejecting") without minting or sending anything."""
+
+    def _oauth_entry(self, idx, *, access_token, refresh_token):
+        return {
+            "id": f"cred-{idx}", "label": f"oauth-{idx}", "auth_type": "oauth",
+            "priority": idx, "source": "manual:hermes_pkce",
+            "access_token": access_token, "refresh_token": refresh_token,
+        }
+
+    def _agent(self, pool):
+        return SimpleNamespace(
+            provider="anthropic", api_key=None, api_mode="anthropic_messages",
+            _credential_pool=pool, _credential_pool_entry_id="cred-0",
+            _swap_credential=MagicMock(return_value=True),
+            _is_entitlement_failure=MagicMock(return_value=False),
+            _vprint=MagicMock(), log_prefix="",
+        )
+
+    def _make_pool(self, tmp_path, monkeypatch, entries):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        for env_var in ("ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
+            monkeypatch.delenv(env_var, raising=False)
+        monkeypatch.setattr(
+            "hermes_cli.auth.is_provider_explicitly_configured", lambda provider: False,
+        )
+        (hermes_home / "auth.json").write_text(
+            json.dumps({"version": 1, "credential_pool": {"anthropic": entries}}),
+            encoding="utf-8",
+        )
+        from agent.credential_pool import load_pool
+        pool = load_pool("anthropic")
+        assert [e.id for e in pool.entries()] == [e["id"] for e in entries], (
+            "pool fixture leaked host credentials into the test pool"
+        )
+        return pool
+
+    def test_persistent_401_on_account_1_rotates_to_account_2_not_straight_to_fallback(
+        self, tmp_path, monkeypatch
+    ):
+        pool = self._make_pool(
+            tmp_path, monkeypatch,
+            [
+                self._oauth_entry(0, access_token="acct1-tok", refresh_token="acct1-rf"),
+                self._oauth_entry(1, access_token="acct2-tok", refresh_token="acct2-rf"),
+            ],
+        )
+        agent = self._agent(pool)
+        account1 = next(e for e in pool.entries() if e.id == "cred-0")
+
+        # Transport-free stub: the OAuth refresh of account 1 always "succeeds" (no
+        # network, no new token minted) yet upstream keeps rejecting it — exactly the
+        # production shape ("invalid x-api-key" repeated, "persists after 2 refreshes").
+        monkeypatch.setattr(pool, "try_refresh_matching", lambda **_kw: account1)
+
+        from agent.agent_runtime_helpers import recover_with_credential_pool
+
+        recovered = has_retried = None
+        for _ in range(3):  # _MAX_AUTH_REFRESH_ATTEMPTS (2) + the call that must rotate
+            recovered, has_retried = recover_with_credential_pool(
+                agent, status_code=401, has_retried_429=has_retried or False,
+                error_context={"reason": "invalid x-api-key"},
+            )
+
+        assert recovered is True, (
+            "must recover by rotating to the second Claude account, not give up and "
+            "let a different-provider fallback (Codex/GPT) activate"
+        )
+        statuses = {e.id: e.last_status for e in pool.entries()}
+        assert statuses["cred-0"] == "exhausted", "account 1 must be benched, not silently retried forever"
+        assert statuses["cred-1"] != "exhausted", "account 2 must remain usable"
+        swapped = agent._swap_credential.call_args[0][0]
+        assert swapped.id == "cred-1", "the live agent must swap onto the SECOND Claude account"
+
+    def test_already_exhausted_second_account_falls_through_to_provider_fallback(
+        self, tmp_path, monkeypatch
+    ):
+        """Negative control: when account 2 is ALSO exhausted, recovery must correctly
+        report failure (not fabricate a rotation) so the caller's provider-level
+        fallback (Codex) is reached — Codex stays the third option, never jumped to
+        while a live same-provider account remains."""
+        pool = self._make_pool(
+            tmp_path, monkeypatch,
+            [
+                self._oauth_entry(0, access_token="acct1-tok", refresh_token="acct1-rf"),
+                {
+                    **self._oauth_entry(1, access_token="acct2-tok", refresh_token="acct2-rf"),
+                    "last_status": "exhausted", "last_status_at": time.time(),
+                    "last_error_code": 401, "last_error_reset_at": time.time() + 3600,
+                },
+            ],
+        )
+        agent = self._agent(pool)
+        account1 = next(e for e in pool.entries() if e.id == "cred-0")
+        monkeypatch.setattr(pool, "try_refresh_matching", lambda **_kw: account1)
+
+        from agent.agent_runtime_helpers import recover_with_credential_pool
+
+        recovered = has_retried = None
+        for _ in range(3):
+            recovered, has_retried = recover_with_credential_pool(
+                agent, status_code=401, has_retried_429=has_retried or False,
+                error_context={"reason": "invalid x-api-key"},
+            )
+
+        assert recovered is False, (
+            "no live same-provider account remains — the caller must now reach its "
+            "provider-level fallback (Codex), which is correct only here"
+        )
+

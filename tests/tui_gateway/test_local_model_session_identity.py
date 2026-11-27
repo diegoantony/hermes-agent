@@ -170,3 +170,56 @@ def test_resume_never_sends_the_default_provider_to_an_endpoint_no_entry_serves(
     assert "provider_override" not in overrides
     assert overrides["model_override"]["base_url"] is None
     assert overrides["model_override"]["api_mode"] is None
+
+
+def test_resume_drops_a_persisted_pair_the_provider_never_served(monkeypatch):
+    """Regression for t_b8c9a019 / fca385d6dca: ``gateway_runtime`` (or an older row written mid a
+    fallback bug) can persist ``anthropic`` + ``gpt-6-1-sol`` — a ROUTABLE provider paired with a
+    model it never served. Unlike an unroutable/renamed provider (healed above), this provider name
+    passes ``_is_routable_provider`` clean, so without the dedicated coherence check the incoherent
+    pair rides straight into the live agent on resume and 404s the first primary turn — not just
+    vision/auxiliary, which session.create's ``model_override_conflict`` never protected either
+    (that guard only runs for the create RPC's own params, not for rows restored on resume)."""
+    cfg = {"model": {"provider": "openai-codex", "default": "gpt-6.1-sol"}}
+    monkeypatch.setattr(rp, "load_config", lambda: cfg)
+    monkeypatch.setattr(rp, "_get_model_config", lambda: cfg["model"])
+    row = {
+        "model": "gpt-6-1-sol",
+        "model_config": {
+            "gateway_runtime": {
+                "provider": "anthropic", "model": "gpt-6-1-sol",
+                "base_url": "https://api.anthropic.com", "api_mode": "anthropic_messages",
+            },
+        },
+    }
+
+    overrides = server._stored_session_runtime_overrides(row)
+
+    assert "provider_override" not in overrides
+    assert "model_override" not in overrides, (
+        "an anthropic/gpt-6-1-sol pair must never reach the live agent on resume — "
+        "the session should rebuild from the profile's current config/fallback instead"
+    )
+
+
+def test_resume_keeps_a_coherent_persisted_pair(monkeypatch):
+    """Control: a genuinely coherent persisted pair (claude model on anthropic) must still resume
+    normally — the new check must not reject valid sessions."""
+    cfg = {"model": {"provider": "anthropic", "default": "claude-opus-5-5"}}
+    monkeypatch.setattr(rp, "load_config", lambda: cfg)
+    monkeypatch.setattr(rp, "_get_model_config", lambda: cfg["model"])
+    row = {
+        "model": "claude-opus-5-5",
+        "model_config": {
+            "gateway_runtime": {
+                "provider": "anthropic", "model": "claude-opus-5-5",
+                "base_url": "https://api.anthropic.com", "api_mode": "anthropic_messages",
+            },
+        },
+    }
+
+    overrides = server._stored_session_runtime_overrides(row)
+
+    assert overrides["provider_override"] == "anthropic"
+    assert overrides["model_override"]["model"] == "claude-opus-5-5"
+    assert overrides["model_override"]["api_mode"] == "anthropic_messages"
