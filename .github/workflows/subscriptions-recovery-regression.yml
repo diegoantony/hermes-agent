@@ -1,0 +1,79 @@
+name: Subscriptions recovery regression (t_b8c9a019)
+
+# Scoped, additive CI gate for this fix only — runs on a standard GitHub-hosted
+# runner (no Blacksmith app, no secrets, no inference/network calls). The
+# repo's full `ci.yaml` orchestrator targets `blacksmith-*` self-hosted
+# runners (see tests.yml / ci.yaml `runs-on:`), which require the Blacksmith
+# GitHub App to be installed on the org/repo. This fork
+# (diegoantony/hermes-agent) has ZERO pull_request-triggered workflow runs in
+# its entire history (verified via `gh api .../actions/runs?event=pull_request`
+# -> total_count: 0) even though scheduled/workflow_dispatch runs on `main`
+# complete normally — consistent with the Blacksmith runner label never being
+# resolvable here, so pull_request jobs queue forever (or never dispatch) and
+# PRs show zero check-runs. Until the Blacksmith app is installed (or the
+# heavy workflows are repointed at `ubuntu-latest` for this fork), this
+# workflow is the only CI signal the fork can produce for a PR. It must not be
+# treated as a substitute for the full suite — it covers only the files this
+# fix touched, offline and credential-free.
+on:
+  pull_request:
+    paths:
+      - 'agent/credential_auth_recovery.py'
+      - 'agent/auxiliary_client.py'
+      - 'hermes_cli/cli_agent_setup_mixin.py'
+      - 'hermes_cli/models_validate.py'
+      - 'tui_gateway/agent_factory.py'
+      - 'tests/agent/test_credential_pool_routing.py'
+      - 'tests/agent/test_auxiliary_main_first.py'
+      - 'tests/hermes_cli/test_cli_provider_resolution.py'
+      - 'tests/hermes_cli/test_update_parked_branch_guard.py'
+      - 'tests/hermes_cli/test_update_config_migration_on_current.py'
+      - 'tests/tui_gateway/test_local_model_session_identity.py'
+      - '.github/workflows/subscriptions-recovery-regression.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: subscriptions-recovery-regression-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Provider/model coherence + credential rotation regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install test dependencies
+        # No `[all]` extras, no provider SDK credentials: this suite exercises
+        # pure routing/config logic, not live network clients.
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -e '.[test]' || pip install -e . pytest
+
+      - name: Run scoped regression suite (no network, no secrets, no inference)
+        env:
+          HERMES_HOME: ${{ runner.temp }}/hermes-ci-home
+        run: |
+          set -euo pipefail
+          python -m pytest -q \
+            tests/agent/test_auxiliary_main_first.py \
+            tests/agent/test_credential_pool_routing.py \
+            tests/hermes_cli/test_cli_provider_resolution.py \
+            tests/hermes_cli/test_model_validation.py \
+            tests/tui_gateway/test_session_create_model_provider_guard.py \
+            tests/hermes_cli/test_update_parked_branch_guard.py \
+            tests/hermes_cli/test_update_config_migration_on_current.py \
+            tests/tui_gateway/test_local_model_session_identity.py \
+            tests/tui_gateway/test_custom_provider_session_persistence.py \
+            tests/tui_gateway/test_resume_profile_scope.py \
+            tests/tui_gateway/test_session_resume_db_ownership.py
