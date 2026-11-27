@@ -198,6 +198,39 @@ class TestResolveAutoMainFirst:
         mock_read_main_model.assert_not_called()
         mock_resolve_auto.assert_called_once()
 
+    def test_gpt_model_with_anthropic_runtime_is_rejected_before_network(self):
+        """Regression: auxiliary vision/text must not send GPT model IDs to Anthropic."""
+        fallback_client = MagicMock()
+        runtime = {
+            "provider": "anthropic",
+            "model": "gpt-6-1-sol",
+            "base_url": "https://api.anthropic.com",
+            "api_mode": "anthropic_messages",
+        }
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client"
+        ) as mock_resolve, patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            return_value=(None, None, ""),
+        ), patch(
+            "agent.auxiliary_client._try_main_fallback_chain",
+            return_value=(fallback_client, "gpt-6-1-sol", "openai-codex"),
+        ) as mock_fallback:
+            from agent.auxiliary_client import _resolve_auto_route
+
+            client, model, provider = _resolve_auto_route(
+                main_runtime=runtime,
+                task="vision",
+            )
+
+        assert (client, model, provider) == (
+            fallback_client,
+            "gpt-6-1-sol",
+            "openai-codex",
+        )
+        mock_resolve.assert_not_called()
+        mock_fallback.assert_called_once()
+
     def test_runtime_base_url_passed_for_named_api_key_provider(self):
         """Named API-key providers inherit the live session endpoint for aux work."""
         token_plan_url = "https://token-plan-sgp.xiaomimimo.com/v1"

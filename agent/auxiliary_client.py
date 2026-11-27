@@ -4375,6 +4375,15 @@ def _try_main_provider_route(
     """Step 1: route aux onto the main provider + main model; None if unusable."""
     if not (main_provider and main_model and main_provider not in {"auto", ""}):
         return None
+    # Fail closed before client construction: persisted sessions and stale fallback state can
+    # otherwise pair a GPT model with Anthropic and produce a network 404 (including vision).
+    from hermes_cli.models_validate import static_model_provider_conflict
+    conflict = static_model_provider_conflict(main_model, main_provider)
+    if conflict is not None:
+        logger.warning(
+            "Auxiliary main route rejected incoherent provider/model pair %s/%s: %s",
+            main_provider, main_model, conflict["message"])
+        return None
     resolved_provider = main_provider
     explicit_base_url = runtime_base_url or None
     health_base_url = _custom_health_base_url(main_provider, explicit_base_url)

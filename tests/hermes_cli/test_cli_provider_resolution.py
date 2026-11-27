@@ -348,6 +348,35 @@ def test_fallback_runtime_resolves_the_fallback_entry_model(monkeypatch, tmp_pat
     assert runtime["base_url"] == "https://opencode.ai/zen/go/v1"
 
 
+def test_fallback_runtime_rejects_provider_model_incoherent_pair(monkeypatch, tmp_path):
+    """A fallback model must never be paired with a runtime from another provider."""
+    from hermes_cli.auth import AuthError
+    from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr("cli._cprint", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **kw: {
+            "provider": "anthropic",
+            "api_mode": "anthropic_messages",
+            "base_url": "https://api.anthropic.com",
+            "api_key": "test-only-placeholder",
+        },
+    )
+
+    shell = CLIAgentSetupMixin.__new__(CLIAgentSetupMixin)
+    shell._fallback_model = [{"provider": "openai-codex", "model": "gpt-6-1-sol"}]
+    runtime = shell._resolve_fallback_runtime(
+        AuthError("rate limited", provider="anthropic", code="rate_limited")
+    )
+
+    assert runtime is None
+    assert getattr(shell, "model", None) != "gpt-6-1-sol"
+
+
 def _quota_auth_error():
     from hermes_cli.auth import CODEX_RATE_LIMITED_CODE, AuthError
     return AuthError(
