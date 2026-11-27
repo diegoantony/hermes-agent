@@ -208,6 +208,64 @@ def test_partial_config_migration_stays_owed_after_update(monkeypatch, capsys, n
     assert "✓ Configuration updated!" not in output
 
 
+def test_already_current_config_preserves_subscriptions_fix_settings_and_auth_untouched(tmp_path, monkeypatch):
+    """Regression for the subscriptions-recovery incident (t_b8c9a019): a config.yaml already at
+    the latest version must come out of ``migrate_config`` byte-identical — in particular the
+    ``updates.parked_branch_strategy`` key the recovery set and the ``auxiliary.*`` block must
+    survive an update untouched (see config.py:1246, new default keys are never materialised to
+    disk). ``auth.json`` — a SIBLING file the update flow has no business opening — must keep its
+    mtime, proving the update never touches credentials."""
+    import hermes_yaml as yaml
+    from hermes_cli import update_cmd_config
+
+    home = tmp_path / '.hermes'
+    home.mkdir()
+    latest = config.DEFAULT_CONFIG['_config_version']
+    live_config = {
+        '_config_version': latest,
+        'updates': {'parked_branch_strategy': 'update_in_place'},
+        'auxiliary': {'vision': {'provider': 'auto', 'model': ''},
+                      'title_generation': {'provider': 'auto', 'model': ''}},
+    }
+    config_path = home / 'config.yaml'
+    config_path.write_text(yaml.safe_dump(live_config), encoding='utf-8')
+    auth_path = home / 'auth.json'
+    auth_path.write_text('{"providers": {}}', encoding='utf-8')
+    before_config_bytes = config_path.read_bytes()
+    before_auth_mtime = auth_path.stat().st_mtime_ns
+
+    monkeypatch.setenv('HERMES_HOME', str(home))
+    monkeypatch.setattr(config, 'get_missing_env_vars', lambda **_: [])
+    monkeypatch.setattr(config, 'get_missing_config_fields', list)
+    monkeypatch.setattr(update_cmd, '_migrate_sibling_profile_configs', lambda *_: [])
+    snapshots = []
+    monkeypatch.setattr(update_cmd_config, '_restore_snapshot_safety_nets', snapshots.append)
+
+    update_cmd_config._check_and_apply_config_migration(pre_update_snapshot_id='snap')
+
+    assert config_path.read_bytes() == before_config_bytes, \
+        "already-current config.yaml must not be rewritten (parked_branch_strategy/auxiliary.* preserved)"
+    assert auth_path.stat().st_mtime_ns == before_auth_mtime, \
+        "the update config check must never touch auth.json"
+    restored = yaml.safe_load(config_path.read_text(encoding='utf-8'))
+    assert restored['updates']['parked_branch_strategy'] == 'update_in_place'
+    assert restored['auxiliary']['vision'] == {'provider': 'auto', 'model': ''}
+
+
+def test_update_code_paths_never_reference_auth_json(tmp_path):
+    """Meta-guard: the update command's own source must not mention ``auth.json`` — credentials
+    are a sibling file the update flow has no reason to open. Catches a future regression before
+    it ever runs, independent of any mocked test above."""
+    import re
+
+    from hermes_cli import update_cmd, update_cmd_config
+    import inspect
+
+    for module in (update_cmd, update_cmd_config):
+        src = inspect.getsource(module)
+        assert not re.search(r"auth\.json", src), f"{module.__name__} must not reference auth.json"
+
+
 def test_a_sibling_migration_that_stopped_stays_owed_after_update(tmp_path, monkeypatch):
     """A sibling profile whose pass stopped at a failing step is owed like the active one: the
     sweep still finishes and the snapshot nets still run, then the update records a follow-up."""

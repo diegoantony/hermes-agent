@@ -546,6 +546,101 @@ def test_update_updates_unmerged_branch_in_place_when_configured(
     assert "feature work" in _git(repo_pair, "log", "--oneline").stdout
 
 
+def _build_repo_pair_with_guard_commit(tmp_path, label):
+    """Standalone origin+clone pair (mirrors the ``repo_pair`` fixture) with the
+    subscriptions-recovery guard commit on the parked ``old-feature`` branch."""
+    origin = tmp_path / f"origin-{label}"
+    origin.mkdir()
+    _git(origin, "init", "-q", "-b", "main")
+    _git(origin, "config", "user.email", "test@example.com")
+    _git(origin, "config", "user.name", "Test")
+    (origin / "a.txt").write_text("one\n", encoding="utf-8")
+    _git(origin, "add", "a.txt")
+    _git(origin, "commit", "-qm", "c1")
+
+    clone = tmp_path / f"clone-{label}"
+    _git(tmp_path, "clone", "-q", str(origin), str(clone))
+    _git(clone, "config", "user.email", "test@example.com")
+    _git(clone, "config", "user.name", "Test")
+    _git(clone, "checkout", "-qb", "old-feature")
+
+    guard_marker = (
+        "if static_model_provider_conflict(main_model, main_provider) is not None:\n"
+        "    return None  # subscriptions-recovery guard: t_b8c9a019 / fca385d6dca\n"
+    )
+    (clone / "auxiliary_guard.py").write_text(guard_marker, encoding="utf-8")
+    _git(clone, "add", "auxiliary_guard.py")
+    _git(clone, "commit", "-qm", "fix(routing): reject provider-model misroutes")
+
+    (origin / "a.txt").write_text("two\n", encoding="utf-8")
+    _git(origin, "commit", "-aqm", "c2")
+    (origin / "b.txt").write_text("three\n", encoding="utf-8")
+    _git(origin, "add", "b.txt")
+    _git(origin, "commit", "-qm", "c3")
+
+    _git(clone, "fetch", "-q", "origin", "main")
+    return clone, guard_marker
+
+
+def test_subscriptions_fix_commit_survives_update_in_place_but_not_default_switch(
+    tmp_path, monkeypatch, capsys
+):
+    """Direct regression for t_b8c9a019: a local commit carrying the subscriptions-recovery
+    guard marker (the actual code added in fca385d6dca — the ``static_model_provider_conflict``
+    call) must survive ``hermes update`` under ``parked_branch_strategy: update_in_place`` (the
+    config this recovery set) — and the test also proves the NEGATIVE: under the default
+    ``switch`` strategy the same commit is abandoned on the parked branch, which is exactly how
+    the fix went missing after a prior update and had to be re-incorporated by hand."""
+    import hermes_cli.config as hermes_config
+
+    class _StopFlow(Exception):
+        pass
+
+    args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
+
+    # --- positive: update_in_place keeps the guard commit AND pulls origin's new code ---
+    clone_a, guard_marker = _build_repo_pair_with_guard_commit(tmp_path, "pos")
+    monkeypatch.setattr(
+        hermes_config, "load_config",
+        lambda: {"updates": {"parked_branch_strategy": "update_in_place"}},
+    )
+    _patch_update_flow(monkeypatch, clone_a)
+    monkeypatch.setattr(
+        update_cmd, "_complete_source_update",
+        lambda *a, **k: (_ for _ in ()).throw(_StopFlow()),
+    )
+    with pytest.raises(_StopFlow):
+        hermes_main.cmd_update(args)
+    assert (clone_a / "auxiliary_guard.py").read_text(encoding="utf-8-sig") == guard_marker
+    assert "fix(routing): reject provider-model misroutes" in _git(clone_a, "log", "--oneline").stdout
+    assert (clone_a / "b.txt").exists()  # origin's new code also arrived
+    assert _git(clone_a, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "old-feature"
+    capsys.readouterr()
+
+    # --- negative control: default "switch" strategy abandons the SAME shape of commit ---
+    clone_b, _ = _build_repo_pair_with_guard_commit(tmp_path, "neg")
+    monkeypatch.setattr(hermes_config, "load_config", dict)  # default strategy: switch
+    _patch_update_flow(monkeypatch, clone_b)
+    monkeypatch.setattr(
+        update_cmd, "_complete_source_update",
+        lambda *a, **k: (_ for _ in ()).throw(_StopFlow()),
+    )
+    with pytest.raises(_StopFlow):
+        hermes_main.cmd_update(args)
+    assert (
+        _git(clone_b, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "main"
+    ), "default strategy switches the checkout off the branch carrying the fix"
+    assert not (clone_b / "auxiliary_guard.py").exists(), (
+        "negative control: without update_in_place the subscriptions-recovery guard commit "
+        "is left behind on the abandoned branch — this is the exact regression mode the "
+        "recovery's config change (updates.parked_branch_strategy=update_in_place) prevents"
+    )
+    # ...but the commit is not lost — it stays reachable on old-feature, recoverable by a human.
+    assert "fix(routing): reject provider-model misroutes" in _git(
+        clone_b, "log", "--oneline", "old-feature"
+    ).stdout
+
+
 def test_switch_branch_flag_overrides_in_place_strategy(
     repo_pair, monkeypatch, capsys
 ):
